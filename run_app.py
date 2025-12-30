@@ -8,6 +8,7 @@ import subprocess
 import sys
 import os
 import argparse
+from config import SERVER_CONFIG
 
 def check_python_version():
     """检查Python版本"""
@@ -42,7 +43,7 @@ def check_dependencies():
     
     print("✅ 依赖包检查通过")
 
-def start_streamlit(port=8501, host='localhost', debug=False):
+def start_streamlit(port=SERVER_CONFIG['port'], host=SERVER_CONFIG['host'], debug=False):
     """启动Streamlit应用"""
     cmd = [
         sys.executable, '-m', 'streamlit', 'run',
@@ -84,14 +85,14 @@ def main():
     parser.add_argument(
         '--port', '-p',
         type=int,
-        default=8501,
-        help='服务端口 (默认: 8501)'
+        default=SERVER_CONFIG['port'],
+        help=f'服务端口 (默认: {SERVER_CONFIG["port"]})'
     )
     
     parser.add_argument(
         '--host',
-        default='localhost',
-        help='服务地址 (默认: localhost)'
+        default=SERVER_CONFIG['host'],
+        help=f'服务地址 (默认: {SERVER_CONFIG["host"]})'
     )
     
     parser.add_argument(

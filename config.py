@@ -20,7 +20,7 @@ STREAMLIT_CONFIG = {
 
 # 默认服务器配置
 SERVER_CONFIG = {
-    'host': 'localhost',
+    'host': '0.0.0.0',
     'port': 8881,
     'headless': True
 }
