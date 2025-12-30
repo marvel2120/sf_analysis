@@ -1,0 +1,14 @@
+# 数据分析和科学计算
+pandas>=1.5.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# 数据获取
+akshare>=1.10.0
+
+# Web应用框架
+streamlit
+
+# 可视化
+plotly
+
