@@ -47,17 +47,13 @@ def start_streamlit(port=SERVER_CONFIG['port'], host=SERVER_CONFIG['host'], debu
     """启动Streamlit应用"""
     cmd = [
         sys.executable, '-m', 'streamlit', 'run',
-        'streamlit_app.py',
-        '--server.port', str(port),
-        '--server.address', host,
-        '--server.headless', 'true'
+        'streamlit_app.py'
     ]
     
     if debug:
         cmd.extend(['--logger.level', 'debug'])
     
     print(f"🚀 启动Streamlit应用...")
-    print(f"📍 访问地址: http://{host}:{port}")
     
     try:
         subprocess.run(cmd, check=True)
