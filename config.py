@@ -92,10 +92,3 @@ LOG_DIR = os.path.join(BASE_DIR, 'logs')
 # 创建必要的目录
 for directory in [CACHE_DIR, LOG_DIR]:
     os.makedirs(directory, exist_ok=True)
-
-# 开发模式配置
-DEBUG_MODE = os.getenv('DEBUG', 'False').lower() == 'true'
-
-if DEBUG_MODE:
-    LOGGING_CONFIG['level'] = 'DEBUG'
-    DATA_CONFIG['cache_hours'] = 0  # 开发模式下禁用缓存
