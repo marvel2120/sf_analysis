@@ -505,6 +505,9 @@ if analyze_button and code:
                             latest = r.get("最新数据", {})
                             advice = r.get("投资建议", {})
                             rs_scores = rs_analysis.get("rs_scores", {})
+                            latest_nav = latest.get("单位净值", 0)
+                            latest_ma30 = latest.get("30周均线", 0)
+                            above_ma30 = latest_ma30 > 0 and latest_nav > latest_ma30
                             row = {
                                 "基金代码": fund_info.get("基金代码", c),
                                 "基金名称": fund_info.get("基金名称", ""),
@@ -514,7 +517,9 @@ if analyze_button and code:
                                 "12周相对强度": rs_scores.get("12周", 0),
                                 "夏普比率": risk_analysis.get("sharpe_ratio", 0),
                                 "最大回撤(%)": risk_analysis.get("max_drawdown", 0),
-                                "最新净值": latest.get("单位净值", 0),
+                                "30周均线": latest_ma30,
+                                "是否在30周线上": "是" if above_ma30 else "否",
+                                "最新净值": latest_nav,
                                 "建议操作": advice.get("建议操作", ""),
                                 "建议仓位(%)": advice.get("建议仓位(%)", 0),
                                 "评分": advice.get("评分", 0),
