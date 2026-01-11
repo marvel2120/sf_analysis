@@ -8,6 +8,10 @@ from scipy import stats
 import warnings
 warnings.filterwarnings('ignore')
 
+RS_POSITIVE_THRESHOLD = 0.0
+MAX_DRAWDOWN_LIMIT = -30.0
+STAGE_CONFIDENCE_MIN = 0.5
+
 # ===================== 基础数据获取函数（小幅优化） =====================
 def fetch_fund_info(fund_code: str) -> dict:
     try:
@@ -225,7 +229,7 @@ def relative_strength_enhanced(fund_weekly: pd.DataFrame, index_weekly: pd.DataF
     # 对齐日期
     aligned = fund_weekly.join(index_weekly[["ret", "log_ret"]], how="inner", rsuffix="_index")
     if len(aligned) < max(lookback_periods):
-        return {"rs_scores": {}, "win_rate": 0.0, "risk_adjusted_rs": 0.0}
+        return {"rs_scores": {}, "win_rates": {}, "risk_adjusted_rs": 0.0, "latest_rs": 0.0}
     
     rs_scores = {}
     win_rates = {}
@@ -267,7 +271,12 @@ def risk_assessment(weekly_df: pd.DataFrame) -> dict:
     3. 夏普比率（无风险利率按年化2%计算）
     """
     if len(weekly_df) < 20:
-        return {"max_drawdown": 0.0, "downside_vol": 0.0, "sharpe": 0.0}
+        return {
+            "max_drawdown": 0.0,
+            "downside_vol_pct": 0.0,
+            "sharpe_ratio": 0.0,
+            "annual_return_pct": 0.0,
+        }
     
     # 最大回撤
     roll_max = weekly_df["close"].rolling(window=len(weekly_df), min_periods=1).max()
@@ -284,10 +293,14 @@ def risk_assessment(weekly_df: pd.DataFrame) -> dict:
     annual_vol = weekly_df["ret"].std() * np.sqrt(52)
     sharpe = (annual_ret - 0.02) / annual_vol if annual_vol > 0 else 0.0
     
+    # risk_assessment函数内补充
+    annual_return = weekly_df["log_ret"].mean() * 52 * 100  # 年化收益率(%)
+    # 返回值补充
     return {
         "max_drawdown": max_drawdown,
         "downside_vol_pct": downside_vol,
-        "sharpe_ratio": round(sharpe, 3)
+        "sharpe_ratio": round(sharpe, 3),
+        "annual_return_pct": round(annual_return, 2)  # 新增年化收益率
     }
 
 def generate_advice_enhanced(stage_info: dict, rs_info: dict, risk_info: dict) -> dict:
@@ -295,12 +308,12 @@ def generate_advice_enhanced(stage_info: dict, rs_info: dict, risk_info: dict) -
     增强版投资建议：
     结合阶段、相对强度、风险指标给出分级建议
     """
-    stage = stage_info["stage"]
-    stage_confidence = stage_info["confidence"]
-    rs_latest = rs_info["latest_rs"]
-    risk_adjusted_rs = rs_info["risk_adjusted_rs"]
-    max_dd = risk_info["max_drawdown"]
-    sharpe = risk_info["sharpe_ratio"]
+    stage = stage_info.get("stage", 0)
+    stage_confidence = stage_info.get("confidence", 0.0)
+    rs_latest = rs_info.get("latest_rs", 0.0)
+    risk_adjusted_rs = rs_info.get("risk_adjusted_rs", 0.0)
+    max_dd = risk_info.get("max_drawdown", 0.0)
+    sharpe = risk_info.get("sharpe_ratio", 0.0)
     
     # 基础建议
     base_advice = {
@@ -351,14 +364,13 @@ def generate_advice_enhanced(stage_info: dict, rs_info: dict, risk_info: dict) -
             note = f"{note}，最大回撤{max_dd}%，夏普比率{sharpe}，建议立即止损"
             action = "止损卖出"
     
-    # 仓位建议
     position_suggestion = {
-        "重仓买入": 70-90,
-        "买入": 40-60,
-        "轻仓买入": 10-30,
-        "轻仓布局": 5-15,
-        "部分止盈": 20-40,
-        "减仓": 0-20,
+        "重仓买入": 80,
+        "买入": 50,
+        "轻仓买入": 25,
+        "轻仓布局": 10,
+        "部分止盈": 20,
+        "减仓": 10,
         "卖出": 0,
         "止损卖出": 0,
         "观望": 0
@@ -371,6 +383,53 @@ def generate_advice_enhanced(stage_info: dict, rs_info: dict, risk_info: dict) -
         "评分": final_score,
         "建议置信度": round(stage_confidence * 100, 1)
     }
+
+# ===================== 回测函数 =====================
+def backtest_fund_strategy(fund_code: str, benchmark_code: str = "sh000300", years: int = 5) -> dict:
+    fund_weekly = fetch_fund_weekly_nav(fund_code, years=years)
+    index_weekly = fetch_index_weekly_close(benchmark_code, years=years)
+    if len(fund_weekly) < 60 or len(index_weekly) < 60:
+        return {"错误": "历史数据不足以回测", "基金代码": fund_code}
+    aligned = fund_weekly.join(index_weekly[["ret"]], how="inner", rsuffix="_index")
+    dates = aligned.index
+    if len(dates) < 60:
+        return {"错误": "历史数据不足以回测", "基金代码": fund_code}
+    start_idx = 30
+    positions = []
+    strat_ret = []
+    for i in range(start_idx, len(dates) - 1):
+        end_date = dates[i]
+        slice_fund = fund_weekly.loc[:end_date]
+        slice_index = index_weekly.loc[:end_date]
+        stage_result = judge_stage_enhanced(slice_fund)
+        rs_result = relative_strength_enhanced(slice_fund, slice_index)
+        risk_result = risk_assessment(slice_fund)
+        advice_result = generate_advice_enhanced(stage_result, rs_result, risk_result)
+        pos = advice_result.get("建议仓位(%)", 0) / 100.0
+        next_date = dates[i + 1]
+        r = fund_weekly.loc[next_date, "ret"]
+        positions.append(pos)
+        strat_ret.append(pos * r)
+    strat_ret_series = pd.Series(strat_ret, index=dates[start_idx + 1:])
+    if len(strat_ret_series) == 0:
+        return {"错误": "回测窗口为空", "基金代码": fund_code}
+    equity = (1 + strat_ret_series).cumprod()
+    weeks = len(strat_ret_series)
+    annual_ret = (equity.iloc[-1] ** (52 / weeks) - 1) * 100
+    roll_max = equity.cummax()
+    drawdown = (equity / roll_max - 1) * 100
+    max_drawdown = drawdown.min()
+    win_rate = (strat_ret_series > 0).sum() / weeks * 100
+    pos_series = pd.Series(positions, index=dates[start_idx:len(dates) - 1])
+    trades = (pos_series.diff().abs() > 0.05).sum()
+    summary = {
+        "年化收益率(%)": round(float(annual_ret), 2),
+        "最大回撤(%)": round(float(max_drawdown), 2),
+        "胜率(%)": round(float(win_rate), 2),
+        "交易次数": int(trades),
+    }
+    equity_df = pd.DataFrame({"策略净值": equity})
+    return {"基金代码": fund_code, "回测概要": summary, "净值曲线": equity_df}
 
 # ===================== 主分析函数 =====================
 def analyze_fund_enhanced(fund_code: str, benchmark_code: str = "sh000300") -> dict:
@@ -398,22 +457,26 @@ def analyze_fund_enhanced(fund_code: str, benchmark_code: str = "sh000300") -> d
     latest_date = fund_weekly.index[-1].strftime("%Y-%m-%d")
     latest_close = round(float(fund_weekly.iloc[-1]["close"]), 4)
     latest_ma30 = round(float(fund_weekly.iloc[-1]["ma30"]), 4)
+    industry_tag = fund_info.get("投资类型") or fund_info.get("基金类型") or fund_info.get("投资风格") or ""
     
     result = {
         "基金基本信息": fund_info,
+        "行业标签": industry_tag,
         "分析日期": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "最新数据": {
             "净值日期": latest_date,
             "单位净值": latest_close,
             "30周均线": latest_ma30,
-            "最大回撤(%)": risk_result["max_drawdown"],
-            "下行波动率(%)": risk_result["downside_vol_pct"],
-            "夏普比率": risk_result["sharpe_ratio"]
+            "最大回撤(%)": risk_result.get("max_drawdown", 0.0),
+            "下行波动率(%)": risk_result.get("downside_vol_pct", 0.0),
+            "夏普比率": risk_result.get("sharpe_ratio", 0.0),
+            "年化收益率(%)": risk_result.get("annual_return_pct", 0.0),
         },
         "趋势分析": stage_result,
         "相对强度分析": rs_result,
         "风险评估": risk_result,
-        "投资建议": advice_result
+        "投资建议": advice_result,
+        "历史周度数据": fund_weekly[["close", "ma10", "ma20", "ma30"]]
     }
     
     return result

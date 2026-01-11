@@ -1,12 +1,13 @@
 import streamlit as st
 import sys
 import os
+import pandas as pd
 
 # 添加当前目录到路径，确保可以导入 advisor
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from advisor_stock import analyze_stock
-from advisor_fund import analyze_fund_enhanced
+from advisor_stock import analyze_stock, fetch_stock_weekly
+from advisor_fund import analyze_fund_enhanced, backtest_fund_strategy
 
 # 设置页面配置
 st.set_page_config(
@@ -67,12 +68,16 @@ with st.sidebar:
     )
     
     # 代码输入
+    batch_mode = False
+    invest_amount = 0.0
     if analysis_type == "股票分析":
         code = st.text_input("请输入股票代码:", placeholder="例如: 000001")
         st.caption("支持A股股票代码，如: 000001, 600000, 300001")
     else:
-        code = st.text_input("请输入基金代码:", placeholder="例如: 000001")
-        st.caption("支持开放式基金代码，如: 000001, 110011")
+        code = st.text_input("请输入基金代码:", placeholder="单只如: 000001，或多只用逗号分隔")
+        st.caption("支持开放式基金代码，如: 000001, 110011；多只基金用逗号分隔可进行批量分析")
+        batch_mode = st.checkbox("批量分析（逗号分隔多个基金代码）")
+        invest_amount = st.number_input("总投资金额(元)", min_value=0.0, value=0.0, step=1000.0)
     
     # 分析按钮
     analyze_button = st.button("🔍 开始分析", type="primary", use_container_width=True)
@@ -230,6 +235,27 @@ def display_stock_analysis(result):
     </div>
     """
     st.markdown(advice_html, unsafe_allow_html=True)
+
+    # 周线走势可视化（收盘价+30周均线+支撑/阻力）
+    stock_code = result.get('股票代码', '').strip()
+    if stock_code:
+        try:
+            weekly_data = fetch_stock_weekly(stock_code, years=3)
+        except Exception:
+            weekly_data = None
+        if weekly_data is not None and len(weekly_data) > 0:
+            try:
+                chart_df = weekly_data[["close", "ma30", "support", "resistance"]].copy()
+                chart_df = chart_df.rename(columns={
+                    "close": "收盘价",
+                    "ma30": "30周均线",
+                    "support": "支撑位",
+                    "resistance": "阻力位",
+                })
+                st.subheader("📈 周线走势（含30周均线、支撑/阻力）")
+                st.line_chart(chart_df)
+            except Exception:
+                pass
     
     # 详细分析
     with st.expander("📈 技术分析详情"):
@@ -316,6 +342,22 @@ def display_fund_analysis(result):
     """
     st.markdown(advice_html, unsafe_allow_html=True)
     
+    # 净值周线走势可视化（含20/30周均线）
+    weekly_data = result.get('历史周度数据')
+    if weekly_data is not None:
+        try:
+            df_weekly = weekly_data.copy()
+            chart_df = df_weekly[["close", "ma20", "ma30"]].copy()
+            chart_df = chart_df.rename(columns={
+                "close": "单位净值",
+                "ma20": "20周均线",
+                "ma30": "30周均线",
+            })
+            st.subheader("📈 净值周线走势（含20/30周均线）")
+            st.line_chart(chart_df)
+        except Exception:
+            pass
+    
     # 趋势分析详情
     with st.expander("📈 趋势分析"):
         if trend_analysis:
@@ -375,7 +417,7 @@ def display_fund_analysis(result):
                 st.write(f"- 最大回撤: {max_drawdown:.1f}%")
                 st.write(f"- 下行波动率: {downside_vol:.1f}%")
                 st.write(f"- 夏普比率: {latest_data.get('夏普比率', 0):.3f}")
-            
+                st.write(f"- 年化收益率: {latest_data.get('年化收益率(%)', 0):.2f}%")
             with col2:
                 st.write("**风险等级评估:**")
                 # 基于回撤的风险等级
@@ -407,6 +449,7 @@ def display_fund_analysis(result):
                 st.write(f"- 基金代码: {fund_info.get('基金代码', '未知')}")
                 st.write(f"- 基金名称: {fund_info.get('基金名称', '未知')}")
                 st.write(f"- 基金类型: {fund_info.get('基金类型', '未知')}")
+                st.write(f"- 行业标签: {result.get('行业标签', fund_info.get('投资类型', '未知'))}")
                 st.write(f"- 成立时间: {fund_info.get('成立时间', '未知')}")
                 st.write(f"- 最新规模: {fund_info.get('最新规模', '未知')}")
             
@@ -440,20 +483,80 @@ if analyze_button and code:
             try:
                 if analysis_type == "股票分析":
                     result = analyze_stock(code.strip())
-                else:
-                    result = analyze_fund_enhanced(code.strip())
-                print(result)
-                if "错误" in result:
-                    st.error(f"分析失败: {result['错误']}")
-                else:
-                    # 显示分析结果
-                    st.success("分析完成！")
-                    
-                    if analysis_type == "股票分析":
-                        display_stock_analysis(result)
+                    print(result)
+                    if "错误" in result:
+                        st.error(f"分析失败: {result['错误']}")
                     else:
-                        display_fund_analysis(result)
-                        
+                        st.success("分析完成！")
+                        display_stock_analysis(result)
+                else:
+                    if batch_mode:
+                        codes = [c.strip() for c in code.split(",") if c.strip()]
+                        results = []
+                        for c in codes:
+                            r = analyze_fund_enhanced(c)
+                            if "错误" in r:
+                                results.append({"基金代码": c, "错误": r.get("错误", "")})
+                                continue
+                            fund_info = r.get("基金基本信息", {})
+                            trend = r.get("趋势分析", {})
+                            rs_analysis = r.get("相对强度分析", {})
+                            risk_analysis = r.get("风险评估", {})
+                            latest = r.get("最新数据", {})
+                            advice = r.get("投资建议", {})
+                            rs_scores = rs_analysis.get("rs_scores", {})
+                            row = {
+                                "基金代码": fund_info.get("基金代码", c),
+                                "基金名称": fund_info.get("基金名称", ""),
+                                "行业": r.get("行业标签", fund_info.get("投资类型", "")),
+                                "当前阶段": trend.get("stage", 0),
+                                "阶段置信度(%)": trend.get("confidence", 0) * 100,
+                                "12周相对强度": rs_scores.get("12周", 0),
+                                "夏普比率": risk_analysis.get("sharpe_ratio", 0),
+                                "最大回撤(%)": risk_analysis.get("max_drawdown", 0),
+                                "最新净值": latest.get("单位净值", 0),
+                                "建议操作": advice.get("建议操作", ""),
+                                "建议仓位(%)": advice.get("建议仓位(%)", 0),
+                                "评分": advice.get("评分", 0),
+                            }
+                            results.append(row)
+                        if results:
+                            st.success("批量分析完成")
+                            df = pd.DataFrame(results)
+                            if "评分" in df.columns:
+                                df = df.sort_values("评分", ascending=False)
+                            if invest_amount and invest_amount > 0 and "建议仓位(%)" in df.columns and "评分" in df.columns:
+                                weights = df["建议仓位(%)"].clip(lower=0) * df["评分"].clip(lower=0)
+                                total_weight = weights.sum()
+                                if total_weight > 0:
+                                    df["目标资金(元)"] = (weights / total_weight * invest_amount).round(2)
+                            st.dataframe(df, use_container_width=True)
+                    else:
+                        result = analyze_fund_enhanced(code.strip())
+                        print(result)
+                        if "错误" in result:
+                            st.error(f"分析失败: {result['错误']}")
+                        else:
+                            st.success("分析完成！")
+                            display_fund_analysis(result)
+                            backtest = backtest_fund_strategy(code.strip())
+                            if "错误" in backtest:
+                                st.info(f"回测未执行: {backtest['错误']}")
+                            else:
+                                st.subheader("📈 策略回测（周频）")
+                                summary = backtest.get("回测概要", {})
+                                col1, col2, col3, col4 = st.columns(4)
+                                with col1:
+                                    st.metric("年化收益率", f"{summary.get('年化收益率(%)', 0):.2f}%")
+                                with col2:
+                                    st.metric("最大回撤", f"{summary.get('最大回撤(%)', 0):.2f}%")
+                                with col3:
+                                    st.metric("胜率", f"{summary.get('胜率(%)', 0):.2f}%")
+                                with col4:
+                                    st.metric("交易次数", summary.get("交易次数", 0))
+                                equity_df = backtest.get("净值曲线")
+                                if isinstance(equity_df, pd.DataFrame) and not equity_df.empty:
+                                    st.line_chart(equity_df)
             except Exception as e:
                 st.error(f"分析过程中出现错误: {str(e)}")
                 st.info("请检查代码是否正确，或稍后重试")

@@ -6,7 +6,7 @@ import warnings
 warnings.filterwarnings('ignore')
 def fetch_stock_info(stock_code: str) -> dict:
     if ak is None:
-        return {}
+        return {"股票代码": stock_code}
     info = {}
     df = None
     try:
@@ -25,14 +25,21 @@ def fetch_stock_info(stock_code: str) -> dict:
             row = spot[spot["代码"] == stock_code]
             if len(row) > 0:
                 r = row.iloc[0]
+                name = str(r.get("名称", ""))
                 info = {
                     "股票代码": stock_code,
-                    "股票名称": str(r.get("名称", "")),
+                    "股票名称": name,
+                    "股票简称": name,
                     "最新价": str(r.get("最新价", "")),
                     "涨跌幅": str(r.get("涨跌幅", "")),
                 }
         except Exception:
             info = {"股票代码": stock_code}
+    # 统一股票名称/简称字段，避免前端取不到名称
+    if "股票简称" not in info and "股票名称" in info:
+        info["股票简称"] = info["股票名称"]
+    if "股票名称" not in info and "股票简称" in info:
+        info["股票名称"] = info["股票简称"]
     info["股票代码"] = stock_code
     return info
 
@@ -72,7 +79,13 @@ def fetch_stock_weekly(stock_code: str, years: int = 5) -> pd.DataFrame:
         df[vol_col] = pd.to_numeric(df[vol_col], errors="coerce")
     df = df.sort_values("date")
     df = df.set_index("date")
-    weekly = df[[price_col] + ([vol_col] if vol_col else [])].resample("W-FRI").last().dropna()
+    # 价格用周五收盘，成交量用全周合计，避免仅用单日放量误判
+    if vol_col:
+        price_weekly = df[[price_col]].resample("W-FRI").last()
+        vol_weekly = df[[vol_col]].resample("W-FRI").sum()
+        weekly = price_weekly.join(vol_weekly, how="inner").dropna(subset=[price_col])
+    else:
+        weekly = df[[price_col]].resample("W-FRI").last().dropna()
     weekly = weekly.rename(columns={price_col: "close", vol_col: "volume"} if vol_col else {price_col: "close"})
     weekly["ma30"] = weekly["close"].rolling(30).mean()
     weekly["ret"] = weekly["close"].pct_change()
@@ -155,6 +168,7 @@ def relative_strength(stock_weekly: pd.DataFrame, index_weekly: pd.DataFrame, lo
 
 
 def detect_breakout(weekly_df: pd.DataFrame, lookback: int = 12, threshold: float = 0.01) -> bool:
+    """向上突破：最近 lookback 周高点被有效突破"""
     if len(weekly_df) < lookback + 1:
         return False
     recent = weekly_df.iloc[-(lookback + 1):-1]
@@ -163,19 +177,33 @@ def detect_breakout(weekly_df: pd.DataFrame, lookback: int = 12, threshold: floa
     return latest["close"] > upper * (1 + threshold)
 
 
+def detect_breakdown(weekly_df: pd.DataFrame, threshold: float = 0.01) -> bool:
+    """向下跌破：当前收盘有效跌破支撑位（20 周低点附近）"""
+    if len(weekly_df) == 0 or "support" not in weekly_df.columns:
+        return False
+    latest = weekly_df.iloc[-1]
+    support = latest.get("support")
+    close = latest.get("close")
+    if pd.isna(support) or pd.isna(close) or support == 0:
+        return False
+    return close < support * (1 - threshold)
+
+
 def generate_advice(
-    stage: int, 
-    rs_score: float, 
-    breakout: bool, 
+    stage: int,
+    rs_score: float,
+    breakout: bool,
     volume_ok: bool,
+    breakdown: bool = False,
     rs_threshold: float = 0.005  # 相对强度临界值（微弱正/负的区分）
 ) -> dict:
     """
     生成投资建议，基于阶段、相对强度、突破、量能多维度判断
     :param stage: 股票阶段（1:筑底, 2:上升, 3:顶部, 4:下跌）
     :param rs_score: 相对强度（股票-指数周度收益率均值）
-    :param breakout: 是否突破阻力位
+    :param breakout: 是否向上突破阻力位
     :param volume_ok: 量能是否放大（突破时成交量>近12周均值1.5倍）
+    :param breakdown: 是否向下跌破支撑位
     :param rs_threshold: 相对强度临界值，区分「微弱正/负」
     :return: 包含建议、说明、评分的字典
     """
@@ -229,15 +257,15 @@ def generate_advice(
 
     # 4. 第四阶段（下跌趋势）：分「极端弱势/普通弱势」
     elif stage == 4:
-        # 4.1 下跌但未破关键支撑 → 止损（小仓位）
-        if not breakout:  # 未跌破支撑位，仍有反弹可能
+        # 4.1 下跌但尚未有效跌破支撑 → 止损（小仓位）
+        if not breakdown:
             action = "止损"
-            note = "第四阶段（下跌趋势）：股价在均线下方+均线斜率向下，建议严格止损（止损位=支撑位-0.05）"
+            note = "第四阶段（下跌趋势）：股价在均线下方+均线斜率向下，建议严格设置止损和仓位，避免进一步亏损"
             score = 25
-        # 4.2 下跌且跌破支撑 → 清仓
+        # 4.2 下跌且有效跌破支撑 → 清仓
         else:
             action = "清仓"
-            note = "第四阶段（下跌趋势）：股价跌破支撑位+均线向下，建议立即清仓，避免深度套牢"
+            note = "第四阶段（下跌趋势）：股价有效跌破支撑位+均线向下，建议立即清仓，避免深度套牢"
             score = 15
 
     # 5. 异常阶段（如阶段值错误）：兜底观望
@@ -254,7 +282,8 @@ def generate_advice(
             "阶段": stage,
             "相对强度": round(rs_score, 4),
             "是否突破": breakout,
-            "量能是否放大": volume_ok
+            "量能是否放大": volume_ok,
+            "是否跌破支撑": breakdown,
         }
     }
 
@@ -264,35 +293,57 @@ def analyze_stock(stock_code: str) -> dict:
     try:
         info = fetch_stock_info(stock_code)
         weekly = fetch_stock_weekly(stock_code)
+        # 数据不足时直接给出提示，避免后续计算异常
+        if weekly is None or len(weekly) < 40:
+            return {
+                "股票代码": stock_code,
+                "股票名称": info.get("股票简称") or info.get("股票名称", ""),
+                "分析日期": datetime.today().strftime("%Y-%m-%d"),
+                "最新收盘": np.nan,
+                "30周均值": np.nan,
+                "阶段": np.nan,
+                "相对强度": np.nan,
+                "是否突破": False,
+                "量能是否放大": False,
+                "支撑位": np.nan,
+                "阻力位": np.nan,
+                "止损建议": np.nan,
+                "投资建议": "",
+                "投资说明": "历史数据不足，暂无法进行有效分析",
+                "投资评分": np.nan,
+                "错误信息": "历史数据不足"
+            }
+
         index_weekly = fetch_index_weekly_close("sh000300")
         stage = judge_stage(weekly)
         rs = relative_strength(weekly, index_weekly, 12) if len(index_weekly) > 0 else 0.0
-        bo = bool(detect_breakout(weekly, 12, 0.01))
+        breakout_up = bool(detect_breakout(weekly, 12, 0.01))
+        breakdown = bool(detect_breakdown(weekly, 0.01))
         vol_ok = True
-        
-        if "volume" in weekly.columns and bo:
+
+        if "volume" in weekly.columns and breakout_up:
             recent = weekly.iloc[-13:-1]
             vol_mean = recent["volume"].mean()
             vol_ok = bool(weekly.iloc[-1]["volume"] > vol_mean * 1.5)
-        
-        advice = generate_advice(stage, rs, bo, vol_ok)
+
+        advice = generate_advice(stage, rs, breakout_up, vol_ok, breakdown)
         latest_close = float(weekly.iloc[-1]["close"])
         latest_ma = float(weekly.iloc[-1]["ma30"])
         support = float(weekly.iloc[-1]["support"])
         resistance = float(weekly.iloc[-1]["resistance"])
         integer_price = np.floor(support)
         stop_loss = (integer_price - 0.05) if support > integer_price else (support - 0.05)
-        
+
         # 整理结果为扁平结构，方便写入CSV
         result = {
             "股票代码": stock_code,
-            "股票名称": info.get("股票简称", ""),
+            "股票名称": info.get("股票简称") or info.get("股票名称", ""),
             "分析日期": datetime.today().strftime("%Y-%m-%d"),
             "最新收盘": latest_close,
             "30周均值": latest_ma,
             "阶段": stage,
             "相对强度": rs,
-            "是否突破": bo,
+            "是否突破": breakout_up,
             "量能是否放大": vol_ok,
             "支撑位": support,
             "阻力位": resistance,
@@ -302,13 +353,13 @@ def analyze_stock(stock_code: str) -> dict:
             "投资评分": advice["评分"],
             "错误信息": ""
         }
-        
+
         return result
-    
+
     except Exception as e:
         return {
             "股票代码": stock_code,
-            "股票名称": "",
+            "股票名称": info.get("股票简称") or info.get("股票名称", "") if "info" in locals() else "",
             "分析日期": datetime.today().strftime("%Y-%m-%d"),
             "最新收盘": np.nan,
             "30周均值": np.nan,
