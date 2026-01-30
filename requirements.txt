@@ -14,3 +14,5 @@ plotly
 
 # 更新平台需求
 altair==4.2.2
+
+imghdr
