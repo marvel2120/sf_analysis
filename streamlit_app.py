@@ -440,6 +440,33 @@ def display_fund_analysis(result):
         else:
             st.write("暂无风险评估数据")
     
+    # 交易策略（新增）
+    trading_strategy = result.get('交易策略', {})
+    if trading_strategy:
+        with st.expander("🎯 具体交易策略"):
+            st.write(f"**{trading_strategy.get('操作计划', '')}**")
+            
+            if trading_strategy.get('分批买入'):
+                st.write("**分批买入计划:**")
+                for batch in trading_strategy['分批买入']:
+                    st.write(f"- 第{batch['批次']}批: {batch['比例']}%仓位，条件: {batch['条件']}")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if trading_strategy.get('止损位') and trading_strategy['止损位'] > 0:
+                    st.write(f"**止损位:** {trading_strategy['止损位']:.3f}")
+                if trading_strategy.get('目标位') and trading_strategy['目标位'] > 0:
+                    st.write(f"**目标位:** {trading_strategy['目标位']:.3f}")
+            
+            with col2:
+                if trading_strategy.get('加仓条件'):
+                    st.write(f"**加仓条件:** {trading_strategy['加仓条件']}")
+                if trading_strategy.get('减仓条件'):
+                    st.write(f"**减仓条件:** {trading_strategy['减仓条件']}")
+            
+            if trading_strategy.get('风险提示'):
+                st.info(f"💡 {trading_strategy['风险提示']}")
+    
     # 基金基本信息
     with st.expander("ℹ️ 基金基本信息"):
         if fund_info:
