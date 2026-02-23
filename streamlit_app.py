@@ -531,6 +531,7 @@ if analyze_button and code:
                             risk_analysis = r.get("风险评估", {})
                             latest = r.get("最新数据", {})
                             advice = r.get("投资建议", {})
+                            s_advice = r.get("交易策略", {})
                             rs_scores = rs_analysis.get("rs_scores", {})
                             latest_nav = latest.get("单位净值", 0)
                             latest_ma30 = latest.get("30周均线", 0)
@@ -538,6 +539,7 @@ if analyze_button and code:
                             row = {
                                 "基金代码": fund_info.get("基金代码", c),
                                 "基金名称": fund_info.get("基金名称", ""),
+                                "交易策略": s_advice,
                                 "行业": r.get("行业标签", fund_info.get("投资类型", "")),
                                 "当前阶段": trend.get("stage", 0),
                                 "阶段置信度(%)": trend.get("confidence", 0) * 100,
