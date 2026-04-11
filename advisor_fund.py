@@ -346,6 +346,7 @@ def generate_advice_enhanced(stage_info: dict, rs_info: dict, risk_info: dict) -
     1. 增加买入时机判断，避免追高
     2. 强化风险控制逻辑
     3. 细化仓位管理策略
+    4. 提供详细的评分计算过程
     """
     stage = stage_info.get("stage", 0)
     stage_confidence = stage_info.get("confidence", 0.0)
@@ -374,82 +375,148 @@ def generate_advice_enhanced(stage_info: dict, rs_info: dict, risk_info: dict) -
     
     action, base_note, base_score, base_position = base_recommendations.get(stage, ("观望", "无明确判断", 30, 10))
     
-    # ===== 风险控制因子 =====
+    # ===== 风险控制因子（强化最大回撤权重）=====
     risk_factors = []
     risk_score = 0
+    risk_details = {}
     
-    # 1. 回撤风险因子
-    if max_dd < -25:  # 回撤过大
+    # 1. 回撤风险因子（权重提升）
+    if max_dd < -30:  # 回撤极大
+        risk_factors.append(f"最大回撤极大({max_dd:.1f}%)")
+        risk_score -= 25
+        risk_details["最大回撤"] = -25
+    elif max_dd < -20:  # 回撤过大
         risk_factors.append(f"最大回撤过大({max_dd:.1f}%)")
-        risk_score -= 15
-    elif max_dd < -15:  # 回撤较大
+        risk_score -= 20
+        risk_details["最大回撤"] = -20
+    elif max_dd < -10:  # 回撤较大
         risk_factors.append(f"回撤较大({max_dd:.1f}%)")
-        risk_score -= 8
+        risk_score -= 10
+        risk_details["最大回撤"] = -10
+    elif max_dd > -5:  # 回撤很小
+        risk_factors.append(f"回撤控制优秀({max_dd:.1f}%)")
+        risk_score += 10
+        risk_details["最大回撤"] = 10
+    else:
+        risk_details["最大回撤"] = 0
     
-    # 2. 夏普比率因子
+    # 2. 夏普比率因子（权重提升）
     if sharpe < -0.5:  # 风险极高
         risk_factors.append(f"风险极高(夏普{sharpe:.2f})")
-        risk_score -= 20
+        risk_score -= 25
+        risk_details["夏普比率"] = -25
     elif sharpe < 0:   # 风险较高
         risk_factors.append(f"风险较高(夏普{sharpe:.2f})")
-        risk_score -= 10
+        risk_score -= 15
+        risk_details["夏普比率"] = -15
     elif sharpe < 0.3: # 风险一般
         risk_factors.append(f"风险一般(夏普{sharpe:.2f})")
         risk_score -= 5
-    elif sharpe > 1.0: # 风险控制好
-        risk_score += 5
+        risk_details["夏普比率"] = -5
+    elif sharpe > 1.5: # 风险控制优秀
+        risk_factors.append(f"风险控制优秀(夏普{sharpe:.2f})")
+        risk_score += 15
+        risk_details["夏普比率"] = 15
+    elif sharpe > 0.8: # 风险控制良好
+        risk_factors.append(f"风险控制良好(夏普{sharpe:.2f})")
+        risk_score += 8
+        risk_details["夏普比率"] = 8
+    else:
+        risk_details["夏普比率"] = 0
     
     # 3. 买入时机因子（避免追高）
     if stage == 2 and price_change_4w > 12:  # 短期涨幅过大
         risk_factors.append(f"短期涨幅过大({price_change_4w:.1f}%)")
         risk_score -= 12
+        risk_details["短期涨幅"] = -12
         action = "谨慎买入"  # 修改建议
         base_note = "上升趋势但短期涨幅过大，建议等待回调"
+    else:
+        risk_details["短期涨幅"] = 0
     
     if rsi > 75:  # RSI超买
         risk_factors.append(f"RSI超买({rsi:.0f})")
         risk_score -= 8
+        risk_details["RSI"] = -8
     elif rsi < 25:  # RSI超卖
         risk_score += 3
+        risk_details["RSI"] = 3
+    else:
+        risk_details["RSI"] = 0
     
     # 4. 均线偏离因子
     if abs(ma30_diff) > 10:  # 远离均线
         risk_factors.append(f"远离均线({ma30_diff:+.1f}%)")
         risk_score -= 6
+        risk_details["均线偏离"] = -6
+    else:
+        risk_details["均线偏离"] = 0
     
     # ===== 收益增强因子 =====
     enhancement_factors = []
     enhancement_score = 0
+    enhancement_details = {}
     
     # 1. 相对强度因子
     if rs_latest > 0.08:  # 相对强度优秀
         enhancement_factors.append(f"相对强度优秀({rs_latest:.1%})")
         enhancement_score += 10
+        enhancement_details["相对强度"] = 10
     elif rs_latest > 0.03:  # 相对强度良好
         enhancement_factors.append(f"相对强度良好({rs_latest:.1%})")
         enhancement_score += 5
+        enhancement_details["相对强度"] = 5
     elif rs_latest < -0.05: # 相对强度较弱
         enhancement_factors.append(f"相对强度较弱({rs_latest:.1%})")
         enhancement_score -= 8
+        enhancement_details["相对强度"] = -8
+    else:
+        enhancement_details["相对强度"] = 0
     
     # 2. 风险调整后收益因子
     if risk_adjusted_rs > 0.5:  # 风险调整收益优秀
         enhancement_factors.append(f"风险调整收益优秀({risk_adjusted_rs:.2f})")
         enhancement_score += 8
+        enhancement_details["风险调整收益"] = 8
     elif risk_adjusted_rs > 0.2:  # 风险调整收益良好
         enhancement_factors.append(f"风险调整收益良好({risk_adjusted_rs:.2f})")
         enhancement_score += 4
+        enhancement_details["风险调整收益"] = 4
+    else:
+        enhancement_details["风险调整收益"] = 0
     
     # 3. 年化收益因子
     if annual_return > 15:  # 年化收益优秀
         enhancement_factors.append(f"年化收益优秀({annual_return:.1f}%)")
         enhancement_score += 6
+        enhancement_details["年化收益"] = 6
     elif annual_return > 8:   # 年化收益良好
         enhancement_factors.append(f"年化收益良好({annual_return:.1f}%)")
         enhancement_score += 3
+        enhancement_details["年化收益"] = 3
+    else:
+        enhancement_details["年化收益"] = 0
     
-    # ===== 综合评分计算 =====
+    # ===== 综合评分计算（突出夏普比率和最大回撤）=====
+    # 基础分数 + 增强分数 + 风险分数
     final_score = base_score + enhancement_score + risk_score
+    
+    # 夏普比率和最大回撤的额外加权调整
+    # 夏普比率正向调整
+    sharpe_adjustment = 0
+    if sharpe > 0.5:
+        sharpe_adjustment = sharpe * 10
+        final_score += sharpe_adjustment
+    elif sharpe < -0.3:
+        sharpe_adjustment = sharpe * 15
+        final_score += sharpe_adjustment
+    
+    # 最大回撤正向调整（回撤越小分数越高）
+    max_dd_adjustment = 0
+    if max_dd > -15:
+        max_dd_adjustment = (max_dd + 15) * 0.5
+        final_score += max_dd_adjustment
+    
     final_score = max(0, min(100, final_score))  # 限制在0-100范围内
     
     # 根据综合评分调整建议
@@ -491,6 +558,18 @@ def generate_advice_enhanced(stage_info: dict, rs_info: dict, risk_info: dict) -
     elif stage == 4:
         detailed_note += "；建议立即减仓或止损，保护本金"
     
+    # 构建评分详情
+    score_details = {
+        "基础分数": base_score,
+        "风险分数": risk_score,
+        "增强分数": enhancement_score,
+        "夏普比率调整": round(sharpe_adjustment, 2),
+        "最大回撤调整": round(max_dd_adjustment, 2),
+        "最终分数": round(final_score, 1),
+        "风险因子详情": risk_details,
+        "增强因子详情": enhancement_details
+    }
+    
     return {
         "建议操作": action,
         "建议仓位(%)": final_position,
@@ -498,7 +577,8 @@ def generate_advice_enhanced(stage_info: dict, rs_info: dict, risk_info: dict) -
         "评分": round(final_score, 1),
         "建议置信度": round(stage_confidence * 100, 1),
         "风险评分": risk_score,
-        "增强评分": enhancement_score
+        "增强评分": enhancement_score,
+        "评分详情": score_details
     }
 
 # ===================== 回测函数 =====================

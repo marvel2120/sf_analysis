@@ -342,6 +342,39 @@ def display_fund_analysis(result):
     """
     st.markdown(advice_html, unsafe_allow_html=True)
     
+    # 评分计算详情
+    score_details = advice_result.get('评分详情', {})
+    if score_details:
+        with st.expander("📊 评分计算详情"):
+            st.write("**评分规则：**")
+            st.write("- 基础分数：根据趋势阶段确定（0-75分）")
+            st.write("- 风险分数：基于最大回撤、夏普比率等风险指标（-100至+15分）")
+            st.write("- 增强分数：基于相对强度、年化收益等收益指标（-10至+24分）")
+            st.write("- 额外调整：夏普比率和最大回撤的加权调整")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write("**评分构成：**")
+                st.write(f"- 基础分数：{score_details.get('基础分数', 0)}")
+                st.write(f"- 风险分数：{score_details.get('风险分数', 0)}")
+                st.write(f"- 增强分数：{score_details.get('增强分数', 0)}")
+                st.write(f"- 夏普比率调整：{score_details.get('夏普比率调整', 0)}")
+                st.write(f"- 最大回撤调整：{score_details.get('最大回撤调整', 0)}")
+                st.write(f"- 最终分数：{score_details.get('最终分数', 0)}")
+            
+            with col2:
+                st.write("**风险因子得分：**")
+                risk_details = score_details.get('风险因子详情', {})
+                for factor, score in risk_details.items():
+                    if score != 0:
+                        st.write(f"- {factor}：{score}")
+                
+                st.write("**增强因子得分：**")
+                enhancement_details = score_details.get('增强因子详情', {})
+                for factor, score in enhancement_details.items():
+                    if score != 0:
+                        st.write(f"- {factor}：{score}")
+    
     # 净值周线走势可视化（含20/30周均线）
     weekly_data = result.get('历史周度数据')
     if weekly_data is not None:
