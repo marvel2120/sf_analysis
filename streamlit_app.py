@@ -527,6 +527,19 @@ def display_fund_analysis(result):
         else:
             st.write("暂无基金基本信息")
     
+    # 最近5周净值与30周均线距离分析
+    recent_5w_data = latest_data.get('最近5周数据', [])
+    if recent_5w_data:
+        st.subheader("📊 最近5周净值与30周均线距离")
+        df_5w = pd.DataFrame(recent_5w_data)
+        st.dataframe(df_5w, use_container_width=True)
+        
+        # 可视化最近5周的距离变化
+        if len(df_5w) > 0:
+            chart_df = df_5w[['日期', '距离(%)']]
+            chart_df = chart_df.set_index('日期')
+            st.line_chart(chart_df, use_container_width=True)
+    
     # 分析元数据
     with st.expander("🔍 分析元数据"):
         st.write(f"**分析时间:** {result.get('分析日期', '未知')}")
@@ -569,6 +582,16 @@ if analyze_button and code:
                             latest_nav = latest.get("单位净值", 0)
                             latest_ma30 = latest.get("30周均线", 0)
                             above_ma30 = latest_ma30 > 0 and latest_nav > latest_ma30
+                            # 计算与30周均线的差距百分比
+                            nav_vs_ma30 = ((latest_nav - latest_ma30) / latest_ma30 * 100) if latest_ma30 > 0 else 0
+                            
+                            # 获取最近5周数据
+                            recent_5w_data = latest.get("最近5周数据", [])
+                            # 提取最近5周的距离数据，用于快速查看
+                            recent_5w_distances = []
+                            for week in recent_5w_data:
+                                recent_5w_distances.append(f"{week['日期']}: {week['距离(%)']}%")
+                            
                             row = {
                                 "基金代码": fund_info.get("基金代码", c),
                                 "基金名称": fund_info.get("基金名称", ""),
@@ -580,8 +603,10 @@ if analyze_button and code:
                                 "夏普比率": risk_analysis.get("sharpe_ratio", 0),
                                 "最大回撤(%)": risk_analysis.get("max_drawdown", 0),
                                 "30周均线": latest_ma30,
-                                "是否在30周线上": "是" if above_ma30 else "否",
                                 "最新净值": latest_nav,
+                                "与30周均线差距(%)": round(nav_vs_ma30, 2),
+                                "是否在30周线上": "是" if above_ma30 else "否",
+                                "最近5周差距变化": "\n".join(recent_5w_distances) if recent_5w_distances else "无数据",
                                 "建议操作": advice.get("建议操作", ""),
                                 "建议仓位(%)": advice.get("建议仓位(%)", 0),
                                 "评分": advice.get("评分", 0),

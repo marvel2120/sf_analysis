@@ -732,10 +732,29 @@ def analyze_fund_enhanced(fund_code: str, benchmark_code: str = "sh000300") -> d
     advice_result = generate_advice_enhanced(stage_result, rs_result, risk_result)
     
     # 3. 生成具体交易策略
+    # 计算最近5周每周的基金净值与对应30周均线的距离
+    recent_5w_data = []
+    if len(fund_weekly) >= 5:
+        for i in range(1, 6):
+            if i <= len(fund_weekly):
+                week_data = fund_weekly.iloc[-i]
+                nav = week_data["close"]
+                ma30 = week_data["ma30"]
+                distance = ((nav - ma30) / ma30 * 100) if ma30 > 0 else 0
+                recent_5w_data.append({
+                    "日期": fund_weekly.index[-i].strftime("%Y-%m-%d"),
+                    "单位净值": round(float(nav), 4),
+                    "30周均线": round(float(ma30), 4),
+                    "距离(%)": round(distance, 2)
+                })
+        # 按日期升序排列（最近的在最后）
+        recent_5w_data.reverse()
+    
     latest_data = {
         "净值日期": fund_weekly.index[-1].strftime("%Y-%m-%d"),
         "单位净值": round(float(fund_weekly.iloc[-1]["close"]), 4),
         "30周均线": round(float(fund_weekly.iloc[-1]["ma30"]), 4),
+        "最近5周数据": recent_5w_data,
         "最大回撤(%)": risk_result.get("max_drawdown", 0.0),
         "下行波动率(%)": risk_result.get("downside_vol_pct", 0.0),
         "夏普比率": risk_result.get("sharpe_ratio", 0.0),
