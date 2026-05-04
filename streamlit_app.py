@@ -6,7 +6,7 @@ import pandas as pd
 # 添加当前目录到路径，确保可以导入 advisor
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from advisor_stock import analyze_stock, fetch_stock_weekly
+from advisor_stock import analyze_stock, fetch_stock_weekly, backtest_stock_strategy
 from advisor_fund import analyze_fund_enhanced, backtest_fund_strategy
 
 # 设置页面配置
@@ -71,8 +71,10 @@ with st.sidebar:
     batch_mode = False
     invest_amount = 0.0
     if analysis_type == "股票分析":
-        code = st.text_input("请输入股票代码:", placeholder="例如: 000001")
-        st.caption("支持A股股票代码，如: 000001, 600000, 300001")
+        code = st.text_input("请输入股票代码:", placeholder="单只如: 000001，或多只用逗号分隔")
+        st.caption("支持A股股票代码，如: 000001, 600000, 300001；多只股票用逗号分隔可进行批量分析")
+        batch_mode = st.checkbox("批量分析（逗号分隔多只股票代码）")
+        invest_amount = st.number_input("总投资金额(元)", min_value=0.0, value=0.0, step=1000.0)
     else:
         code = st.text_input("请输入基金代码:", placeholder="单只如: 000001，或多只用逗号分隔")
         st.caption("支持开放式基金代码，如: 000001, 110011；多只基金用逗号分隔可进行批量分析")
@@ -169,74 +171,93 @@ def display_welcome():
         """, unsafe_allow_html=True)
 
 def display_stock_analysis(result):
-    """显示股票分析结果"""
+    """显示增强版股票分析结果"""
     st.header(f"📊 {result.get('股票代码', 'Unknown')} {result.get('股票名称', '')} 股票分析报告")
     
-    # 基本信息卡片 - 适配实际的返回值格式
+    score = result.get('投资评分', 60)
+    stage = result.get('阶段', 1)
+    stage_names = {1: "筑底期", 2: "上升期", 3: "顶部期", 4: "下跌期"}
+    stage_name = stage_names.get(stage, f"第{stage}阶段")
+    confidence = result.get('阶段置信度', 0)
+    
     col1, col2, col3, col4 = st.columns(4)
-    
     with col1:
-        # 根据投资评分判断趋势阶段
-        score = result.get('投资评分', 60)
-        if score >= 80:
-            stage = "强势上升"
-        elif score >= 70:
-            stage = "温和上升"
-        elif score >= 60:
-            stage = "震荡整理"
-        elif score >= 40:
-            stage = "弱势整理"
-        else:
-            stage = "下降趋势"
-        st.metric("当前趋势", stage)
-    
+        st.metric("当前趋势", stage_name, delta=f"置信度{confidence*100:.0f}%")
     with col2:
         rs_value = result.get('相对强度', 0)
-        st.metric("相对强度", f"{rs_value:.3f}")
-    
+        st.metric("相对强度(12周)", f"{rs_value:+.4f}")
     with col3:
-        breakout = result.get('是否突破', False)
-        st.metric("突破信号", "是" if breakout else "否")
-    
+        rsi_val = result.get('RSI', 50)
+        st.metric("RSI(14周)", f"{rsi_val:.1f}",
+                 delta="超买" if rsi_val > 70 else "超卖" if rsi_val < 30 else None,
+                 delta_color="inverse" if rsi_val > 70 else "normal")
     with col4:
-        volume_ok = result.get('量能是否放大', True)
-        st.metric("量能配合", "良好" if volume_ok else "不足")
-    
-    # 价格信息卡片
+        vol_trend = result.get('量能趋势', 'normal')
+        vol_trend_map = {"放量": "📈 放量", "缩量": "📉 缩量", "normal": "正常"}
+        st.metric("量能趋势", vol_trend_map.get(vol_trend, "正常"))
+
     col1, col2, col3, col4 = st.columns(4)
-    
     with col1:
         latest_price = result.get('最新收盘', 0)
         st.metric("最新收盘", f"{latest_price:.2f}")
-    
     with col2:
         ma30 = result.get('30周均值', 0)
         st.metric("30周均值", f"{ma30:.3f}")
-    
     with col3:
         support = result.get('支撑位', 0)
         st.metric("支撑位", f"{support:.2f}")
-    
     with col4:
         resistance = result.get('阻力位', 0)
         st.metric("阻力位", f"{resistance:.2f}")
-    
-    # 投资建议
+
     advice = result.get('投资建议', '观望')
     advice_class = get_advice_class(advice)
-    score = result.get('投资评分', 60)
+    pos_pct = result.get('建议仓位(%)', 0)
     
     st.subheader("💡 投资建议")
     advice_html = f"""
     <div class="advice-box {advice_class}">
-        <h3>{advice} (评分: {score}/100)</h3>
+        <h3>{advice} (评分: {score}/100 | 建议仓位: {pos_pct}%)</h3>
         <p><strong>投资说明:</strong> {result.get('投资说明', '暂无详细说明')}</p>
         {f'<p><strong>止损建议:</strong> {result.get("止损建议", 0):.2f}</p>' if result.get('止损建议') else ''}
+        {f'<p><strong>阶段说明:</strong> {result.get("阶段说明", "")}</p>' if result.get('阶段说明') else ''}
     </div>
     """
     st.markdown(advice_html, unsafe_allow_html=True)
 
-    # 周线走势可视化（收盘价+30周均线+支撑/阻力）
+    # 交易策略
+    strategy = result.get('交易策略', {})
+    if strategy:
+        with st.expander("🎯 交易策略", expanded=True):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write(f"**建议仓位:** {strategy.get('建议仓位(%)', 0)}%")
+                st.write(f"**当前价:** {strategy.get('当前价', 0):.2f}")
+                st.write(f"**止损位:** {strategy.get('止损位', 0):.2f}")
+                st.write(f"**目标位:** {strategy.get('目标位', 0):.2f}")
+            with col2:
+                if strategy.get('分批买入'):
+                    st.write("**分批买入计划:**")
+                    for b in strategy['分批买入']:
+                        st.write(f"- 第{b['批次']}批: {b['比例']}% {b['条件']}")
+                if strategy.get('加仓条件'):
+                    st.write(f"**加仓条件:** {strategy['加仓条件']}")
+                if strategy.get('减仓条件'):
+                    st.write(f"**减仓条件:** {strategy['减仓条件']}")
+
+    # 近五周均线差距
+    recent_5_weeks = result.get('近五周均线差距', [])
+    if recent_5_weeks:
+        st.subheader("📅 最近五周与30周均线差距趋势")
+        df_gap = pd.DataFrame(recent_5_weeks)
+        if not df_gap.empty:
+            df_gap['差距变化'] = df_gap['gap_pct'].apply(lambda x: f"{x:+.2f}%")
+            df_gap['收盘价'] = df_gap['close'].apply(lambda x: f"{x:.2f}")
+            df_gap['30周均线'] = df_gap['ma30'].apply(lambda x: f"{x:.2f}")
+            df_gap = df_gap.rename(columns={'date': '日期'})
+            st.table(df_gap[['日期', '收盘价', '30周均线', '差距变化']].set_index('日期'))
+
+    # 周线走势
     stock_code = result.get('股票代码', '').strip()
     if stock_code:
         try:
@@ -247,39 +268,76 @@ def display_stock_analysis(result):
             try:
                 chart_df = weekly_data[["close", "ma30", "support", "resistance"]].copy()
                 chart_df = chart_df.rename(columns={
-                    "close": "收盘价",
-                    "ma30": "30周均线",
-                    "support": "支撑位",
-                    "resistance": "阻力位",
+                    "close": "收盘价", "ma30": "30周均线",
+                    "support": "支撑位", "resistance": "阻力位",
                 })
                 st.subheader("📈 周线走势（含30周均线、支撑/阻力）")
                 st.line_chart(chart_df)
             except Exception:
                 pass
-    
+
     # 详细分析
     with st.expander("📈 技术分析详情"):
         st.write(f"**分析日期:** {result.get('分析日期', '未知')}")
-        st.write(f"**当前阶段:** 第{result.get('阶段', 1)}阶段")
-        
-        # 错误信息显示
+        st.write(f"**当前阶段:** 第{result.get('阶段', 1)}阶段 ({stage_name})")
         if result.get('错误信息'):
             st.error(f"⚠️ 分析警告: {result.get('错误信息')}")
         
-        # 技术指标说明
         col1, col2 = st.columns(2)
         with col1:
-            st.write("**关键指标:**")
-            st.write(f"- 相对强度: {rs_value:.4f}")
-            st.write(f"- 突破状态: {'已突破' if breakout else '未突破'}")
-            st.write(f"- 量能状态: {'放大' if volume_ok else '正常'}")
-        
+            st.write("**技术指标:**")
+            st.write(f"- 相对强度(12周): {result.get('相对强度', 0):+.4f}")
+            st.write(f"- RSI(14周): {result.get('RSI', 50):.1f}")
+            st.write(f"- 突破状态: {'已突破' if result.get('是否突破') else '未突破'}")
+            st.write(f"- 量能: {'放大' if result.get('量能是否放大') else '正常'}")
+            st.write(f"- 量能趋势: {result.get('量能趋势', 'normal')}")
+            st.write(f"- 量价比率: {result.get('量价比率', 1.0):.2f}")
+            divergence = result.get('量价背离', 0)
+            if divergence != 0:
+                st.write(f"- 量价背离: {'顶背离⚠️' if divergence == -1 else '底背离💡'}")
         with col2:
-            st.write("**关键价位:**")
+            st.write("**风险指标:**")
+            st.write(f"- 最大回撤: {result.get('最大回撤%', 0):.1f}%")
+            st.write(f"- 年化波动率: {result.get('年化波动率%', 0):.1f}%")
+            st.write(f"- ATR: {result.get('ATR', 0):.4f}")
             st.write(f"- 支撑位: {support:.2f}")
             st.write(f"- 阻力位: {resistance:.2f}")
-            if result.get('止损建议'):
-                st.write(f"- 止损位: {result.get('止损建议'):.2f}")
+            st.write(f"- 止损建议: {result.get('止损建议', 0):.2f}")
+
+    # 多周期相对强度
+    rs_scores = result.get('多周期相对强度', {})
+    win_rates = result.get('胜率', {})
+    if rs_scores:
+        with st.expander("📊 多周期相对强度分析"):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write("**相对强度（超额收益）:**")
+                for period in ['12周', '26周', '52周']:
+                    v = rs_scores.get(period, 0)
+                    st.write(f"- {period}: {v:+.4f}")
+                st.write(f"- 风险调整超额: {result.get('风险调整超额收益', 0):+.3f}")
+            with col2:
+                st.write("**跑赢指数胜率:**")
+                for period in ['12周', '26周', '52周']:
+                    v = win_rates.get(period, 0)
+                    st.write(f"- {period}: {v*100:.0f}%")
+
+    # 评分详情
+    score_details = result.get('评分详情', {})
+    if score_details:
+        with st.expander("🧮 评分计算详情"):
+            st.write("**评分构成：**")
+            st.write(f"- 基础分数（阶段分）: {score_details.get('基础分数', 0)}")
+            st.write(f"- 增强分数（收益因子）: {score_details.get('增强分数', 0)}")
+            st.write(f"- 风险分数（风险因子）: {score_details.get('风险分数', 0)}")
+            st.write(f"- 最终分数: {score_details.get('最终分数', 0)}")
+            
+            st.write("**增强因子:**")
+            for f in score_details.get('增强因子', []):
+                st.write(f"- {f}")
+            st.write("**风险因子:**")
+            for f in score_details.get('风险因子', []):
+                st.write(f"- {f}")
 
 def display_fund_analysis(result):
     """显示基金分析结果 - 基于新的数据结构"""
@@ -555,13 +613,120 @@ if analyze_button and code:
         with st.spinner(f"正在分析 {code}，请稍候..."):
             try:
                 if analysis_type == "股票分析":
-                    result = analyze_stock(code.strip())
-                    print(result)
-                    if "错误" in result:
-                        st.error(f"分析失败: {result['错误']}")
+                    if batch_mode:
+                        codes = [c.strip() for c in code.split(",") if c.strip()]
+                        results = []
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        for idx, c in enumerate(codes):
+                            status_text.text(f"正在分析第 {idx+1}/{len(codes)} 只股票: {c}")
+                            r = analyze_stock(c)
+                            error_msg = r.get("错误信息", "")
+                            if error_msg == "历史数据不足":
+                                r["分析状态"] = "数据不足"
+                            elif error_msg:
+                                r["分析状态"] = "分析失败"
+                            else:
+                                r["分析状态"] = "成功"
+                            
+                            recent_5w = r.get("近五周均线差距", [])
+                            gap_trend = ""
+                            if len(recent_5w) >= 3:
+                                gaps = [w["gap_pct"] for w in recent_5w]
+                                if gaps[-1] > gaps[0]:
+                                    gap_trend = "逐步靠近 ↑" if gaps[-1] < 0 else "逐步远离 ↑"
+                                elif gaps[-1] < gaps[0]:
+                                    gap_trend = "逐步远离 ↓" if gaps[-1] < 0 else "逐步靠近 ↓"
+                                else:
+                                    gap_trend = "基本持平"
+                            
+                            strategy = r.get("交易策略", {})
+                            row = {
+                                "股票代码": c,
+                                "股票名称": r.get("股票名称", ""),
+                                "投资建议": r.get("投资建议", ""),
+                                "评分": r.get("投资评分", 0),
+                                "建议仓位(%)": r.get("建议仓位(%)", 0),
+                                "当前阶段": r.get("阶段", ""),
+                                "相对强度": r.get("相对强度", 0),
+                                "RSI": r.get("RSI", 50),
+                                "夏普比率": r.get("夏普比率", 0),
+                                "最大回撤(%)": r.get("最大回撤%", 0),
+                                "30周均值": r.get("30周均值", 0),
+                                "最新收盘": r.get("最新收盘", 0),
+                                "是否在30周线上": "是" if r.get("最新收盘", 0) > r.get("30周均值", 0) else "否",
+                                "近5周差距变化趋势": gap_trend,
+                                "止损位": r.get("止损建议", ""),
+                                "目标位": strategy.get("目标位", ""),
+                                "分析状态": r.get("分析状态", "成功"),
+                            }
+                            results.append(row)
+                            progress_bar.progress((idx + 1) / len(codes))
+                        
+                        status_text.empty()
+                        progress_bar.empty()
+                        
+                        st.success(f"批量分析完成！共分析 {len(results)} 只股票")
+                        df = pd.DataFrame(results)
+                        if "评分" in df.columns:
+                            df = df.sort_values("评分", ascending=False)
+                        
+                        if invest_amount and invest_amount > 0:
+                            weights = df["评分"].clip(lower=0)
+                            total_weight = weights.sum()
+                            if total_weight > 0:
+                                df["目标资金(元)"] = (weights / total_weight * invest_amount).round(2)
+                        
+                        st.dataframe(df, use_container_width=True, hide_index=True)
+                        
+                        # 批量汇总统计
+                        with st.expander("📊 批量汇总统计"):
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                buy_count = len(df[df["投资建议"].isin(["买入", "谨慎买入"])])
+                                st.metric("建议买入/谨慎买入", f"{buy_count}只")
+                            with col2:
+                                avg_score = df["评分"].mean()
+                                st.metric("平均评分", f"{avg_score:.1f}")
+                            with col3:
+                                above_ma30 = (df["是否在30周线上"] == "是").sum()
+                                st.metric("在30周线上方", f"{above_ma30}只")
                     else:
-                        st.success("分析完成！")
-                        display_stock_analysis(result)
+                        result = analyze_stock(code.strip())
+                        if "错误" in result:
+                            st.error(f"分析失败: {result['错误']}")
+                        else:
+                            st.success("分析完成！")
+                            display_stock_analysis(result)
+                            
+                            with st.spinner("正在执行策略历史回测..."):
+                                backtest = backtest_stock_strategy(code.strip())
+                                if "错误" in backtest:
+                                    st.info(f"回测说明: {backtest['错误']}")
+                                else:
+                                    st.subheader("📈 策略历史回测")
+                                    summary = backtest.get("回测概要", {})
+                                    col1, col2, col3, col4 = st.columns(4)
+                                    with col1:
+                                        st.metric("回测周期", f"{summary.get('总交易周数', 0)}周")
+                                    with col2:
+                                        buy_win = summary.get('买入信号8周胜率', 0)
+                                        st.metric("买入信号8周胜率", f"{buy_win:.1f}%" if not pd.isna(buy_win) else "N/A")
+                                    with col3:
+                                        buy_avg = summary.get('买入信号8周平均收益%', 0)
+                                        st.metric("买入信号8周均值", f"{buy_avg:+.2f}%" if not pd.isna(buy_avg) else "N/A")
+                                    with col4:
+                                        sell_acc = summary.get('卖出信号8周准确率', 0)
+                                        st.metric("卖出信号8周准确率", f"{sell_acc:.1f}%" if sell_acc else "N/A")
+                                    
+                                    with st.expander("📊 按评分分组的回测表现"):
+                                        st.write("不同评分区间的信号表现：")
+                                        for label in ["0-20", "20-40", "40-60", "60-80", "80-100"]:
+                                            cnt = summary.get(f'评分{label}信号数', 0)
+                                            if cnt:
+                                                wr = summary.get(f'评分{label}8周胜率', 0)
+                                                avg_ret = summary.get(f'评分{label}8周平均收益%', 0)
+                                                st.write(f"- 评分{label}: {cnt}次信号, 8周胜率{wr:.1f}%, 平均收益{avg_ret:+.2f}%")
                 else:
                     if batch_mode:
                         codes = [c.strip() for c in code.split(",") if c.strip()]

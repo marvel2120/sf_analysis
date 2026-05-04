@@ -2,8 +2,12 @@ from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 import akshare as ak
+from scipy import stats
 import warnings
 warnings.filterwarnings('ignore')
+
+# ===================== 基础数据获取 =====================
+
 def fetch_stock_info(stock_code: str) -> dict:
     if ak is None:
         return {"股票代码": stock_code}
@@ -22,6 +26,7 @@ def fetch_stock_info(stock_code: str) -> dict:
     if not info:
         try:
             spot = ak.stock_zh_a_spot_em()
+            spot["代码"] = spot["代码"].astype(str)
             row = spot[spot["代码"] == stock_code]
             if len(row) > 0:
                 r = row.iloc[0]
@@ -35,7 +40,16 @@ def fetch_stock_info(stock_code: str) -> dict:
                 }
         except Exception:
             info = {"股票代码": stock_code}
-    # 统一股票名称/简称字段，避免前端取不到名称
+    if not info.get("股票名称") and not info.get("股票简称"):
+        try:
+            hist = ak.stock_zh_a_hist(symbol=stock_code, period="daily", start_date="20250101", end_date="20250110", adjust="qfq")
+            if hist is not None and len(hist) > 0:
+                name = str(hist.iloc[0].get("股票名称", ""))
+                if name:
+                    info["股票名称"] = name
+                    info["股票简称"] = name
+        except Exception:
+            pass
     if "股票简称" not in info and "股票名称" in info:
         info["股票简称"] = info["股票名称"]
     if "股票名称" not in info and "股票简称" in info:
@@ -65,33 +79,75 @@ def fetch_stock_weekly(stock_code: str, years: int = 5) -> pd.DataFrame:
             df = None
     if df is None or len(df) == 0:
         return pd.DataFrame()
-    if "日期" in df.columns:
-        df["date"] = pd.to_datetime(df["日期"])
-    elif "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"])
-    else:
+
+    col_map = {
+        "日期": "date", "开盘": "open", "收盘": "close",
+        "最高": "high", "最低": "low", "成交量": "volume",
+        "成交额": "amount", "振幅": "amplitude", "换手率": "turnover"
+    }
+    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+
+    if "date" not in df.columns:
         return pd.DataFrame()
-    price_col = "收盘" if "收盘" in df.columns else ("close" if "close" in df.columns else None)
-    if price_col is None:
-        return pd.DataFrame()
-    df[price_col] = pd.to_numeric(df[price_col], errors="coerce")
-    if vol_col := ("成交量" if "成交量" in df.columns else ("volume" if "volume" in df.columns else None)):
-        df[vol_col] = pd.to_numeric(df[vol_col], errors="coerce")
-    df = df.sort_values("date")
-    df = df.set_index("date")
-    # 价格用周五收盘，成交量用全周合计，避免仅用单日放量误判
-    if vol_col:
-        price_weekly = df[[price_col]].resample("W-FRI").last()
-        vol_weekly = df[[vol_col]].resample("W-FRI").sum()
-        weekly = price_weekly.join(vol_weekly, how="inner").dropna(subset=[price_col])
-    else:
-        weekly = df[[price_col]].resample("W-FRI").last().dropna()
-    weekly = weekly.rename(columns={price_col: "close", vol_col: "volume"} if vol_col else {price_col: "close"})
+    df["date"] = pd.to_datetime(df["date"])
+    for col in ["open", "close", "high", "low", "volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.sort_values("date").set_index("date")
+
+    need_cols = ["close"]
+    if "open" in df.columns:
+        need_cols.append("open")
+    if "high" in df.columns:
+        need_cols.append("high")
+    if "low" in df.columns:
+        need_cols.append("low")
+    if "volume" in df.columns:
+        need_cols.append("volume")
+
+    weekly_dict = {}
+    for col in need_cols:
+        if col == "volume":
+            weekly_dict[col] = df[col].resample("W-FRI").sum()
+        elif col in ("high", "max"):
+            weekly_dict[col] = df[col].resample("W-FRI").max()
+        elif col in ("low", "min"):
+            weekly_dict[col] = df[col].resample("W-FRI").min()
+        elif col == "open":
+            weekly_dict[col] = df[col].resample("W-FRI").first()
+        else:
+            weekly_dict[col] = df[col].resample("W-FRI").last()
+    weekly = pd.DataFrame(weekly_dict).dropna(subset=["close"])
+
+    weekly["ma10"] = weekly["close"].rolling(10).mean()
+    weekly["ma20"] = weekly["close"].rolling(20).mean()
     weekly["ma30"] = weekly["close"].rolling(30).mean()
     weekly["ret"] = weekly["close"].pct_change()
+    weekly["log_ret"] = np.log(weekly["close"] / weekly["close"].shift(1))
+
+    if "volume" in weekly.columns:
+        weekly["vol_ma5"] = weekly["volume"].rolling(5).mean()
+        weekly["vol_ma20"] = weekly["volume"].rolling(20).mean()
+
+    if all(c in weekly.columns for c in ["high", "low"]):
+        weekly["atr"] = compute_atr(weekly, 14)
     weekly["support"] = weekly["close"].rolling(20).min()
     weekly["resistance"] = weekly["close"].rolling(20).max()
-    weekly = weekly.dropna()
+
+    bb = compute_bollinger_bands(weekly["close"], 20, 2)
+    weekly["bb_upper"] = bb["upper"]
+    weekly["bb_lower"] = bb["lower"]
+
+    weekly["volatility"] = weekly["ret"].rolling(10).std() * np.sqrt(52)
+
+    weekly["rsi"] = compute_rsi_series(weekly["close"], 14)
+
+    macd_data = compute_macd(weekly["close"])
+    weekly["macd"] = macd_data["macd"]
+    weekly["macd_signal"] = macd_data["signal"]
+    weekly["macd_histogram"] = macd_data["histogram"]
+
+    weekly = weekly.dropna(subset=["ma30", "ma10", "ma20"])
     return weekly
 
 
@@ -128,57 +184,292 @@ def fetch_index_weekly_close(index_symbol: str = "sh000300", years: int = 3) -> 
     weekly = df[[price_col]].resample("W-FRI").last().dropna()
     weekly = weekly.rename(columns={price_col: "close"})
     weekly["ret"] = weekly["close"].pct_change()
+    weekly["log_ret"] = np.log(weekly["close"] / weekly["close"].shift(1))
     weekly = weekly.dropna()
     return weekly
 
 
-def compute_ma_slope(series: pd.Series, window: int = 10) -> float:
+# ===================== 技术指标计算 =====================
+
+def compute_ma_slope(series: pd.Series, window: int = 10) -> tuple:
     s = series.dropna()
     if len(s) < window:
-        return 0.0
+        return 0.0, 0.0
     x = np.arange(window)
     y = s.iloc[-window:].to_numpy()
-    coeffs = np.polyfit(x, y, 1)
-    return float(coeffs[0])
+    slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+    slope_normalized = slope / s.iloc[-window:].mean() * 100
+    return float(slope_normalized), float(r_value ** 2)
 
 
-def judge_stage(weekly_df: pd.DataFrame) -> int:
+def compute_rsi_series(prices: pd.Series, period: int = 14) -> pd.Series:
+    delta = prices.diff()
+    gains = delta.where(delta > 0, 0.0)
+    losses = -delta.where(delta < 0, 0.0)
+    avg_gains = gains.rolling(window=period, min_periods=period).mean()
+    avg_losses = losses.rolling(window=period, min_periods=period).mean()
+    rs = avg_gains / avg_losses.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+
+def calculate_rsi(prices: pd.Series, period: int = 14) -> float:
+    rsi_series = compute_rsi_series(prices, period)
+    val = rsi_series.iloc[-1] if len(rsi_series) > 0 else 50.0
+    return float(val) if not pd.isna(val) else 50.0
+
+
+def compute_macd(prices: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> dict:
+    ema_fast = prices.ewm(span=fast, adjust=False).mean()
+    ema_slow = prices.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return {"macd": macd_line, "signal": signal_line, "histogram": histogram}
+
+
+def compute_bollinger_bands(prices: pd.Series, window: int = 20, num_std: float = 2.0) -> dict:
+    middle = prices.rolling(window).mean()
+    std = prices.rolling(window).std()
+    upper = middle + num_std * std
+    lower = middle - num_std * std
+    return {"upper": upper, "lower": lower, "middle": middle}
+
+
+def compute_atr(weekly_df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = weekly_df["high"]
+    low = weekly_df["low"]
+    close = weekly_df["close"]
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(window=period, min_periods=period).mean()
+    return atr
+
+
+def compute_macd_divergence(macd_histogram: pd.Series, prices: pd.Series, lookback: int = 10) -> int:
+    recent_prices = prices.iloc[-lookback:]
+    recent_macd = macd_histogram.iloc[-lookback:]
+    if len(recent_prices) < lookback or len(recent_macd) < lookback:
+        return 0
+    price_high = recent_prices.max()
+    price_low = recent_prices.min()
+    macd_high = recent_macd.max()
+    macd_low = recent_macd.min()
+    latest_price = recent_prices.iloc[-1]
+    latest_macd = recent_macd.iloc[-1]
+    if latest_price >= price_high * 0.98 and latest_macd <= macd_high * 0.5:
+        return -1
+    if latest_price <= price_low * 1.02 and latest_macd >= macd_low * 0.5:
+        return 1
+    return 0
+
+
+# ===================== 核心分析 =====================
+
+def judge_stage_enhanced(weekly_df: pd.DataFrame) -> dict:
+    if len(weekly_df) < 30:
+        return {"stage": 0, "confidence": 0.0, "reason": "数据不足"}
+
     latest = weekly_df.iloc[-1]
-    ma = latest["ma30"]
+    prev = weekly_df.iloc[-2]
+    ma10, ma20, ma30 = latest["ma10"], latest["ma20"], latest["ma30"]
     close = latest["close"]
-    slope = compute_ma_slope(weekly_df["ma30"], 10)
-    diff = close / ma - 1 if ma and ma != 0 else 0
-    if close < ma and slope < 0 and diff < -0.03:
-        return 4
-    if close > ma and slope > 0:
-        return 2
-    if close > ma and slope <= 0:
-        return 3
-    return 1
+    rsi = latest.get("rsi", 50.0)
+    vol_ratio = 1.0
+    if "volume" in weekly_df.columns and "vol_ma20" in weekly_df.columns:
+        vol_ratio = latest["volume"] / latest["vol_ma20"] if latest["vol_ma20"] > 0 else 1.0
+
+    diff10 = (close / ma10 - 1) * 100
+    diff20 = (close / ma20 - 1) * 100
+    diff30 = (close / ma30 - 1) * 100
+
+    slope30, r2_30 = compute_ma_slope(weekly_df["ma30"], 10)
+    slope20, r2_20 = compute_ma_slope(weekly_df["ma20"], 10)
+
+    ma_arrangement = 1 if ma10 > ma20 > ma30 else (-1 if ma10 < ma20 < ma30 else 0)
+
+    price_change_4w = (close / weekly_df["close"].iloc[-4] - 1) * 100 if len(weekly_df) >= 4 else 0
+    price_change_8w = (close / weekly_df["close"].iloc[-8] - 1) * 100 if len(weekly_df) >= 8 else 0
+
+    stage = 0
+    confidence = 0.0
+    reason = ""
+
+    if (diff30 < -3 and slope30 < -0.1 and r2_30 > 0.6
+            and ma_arrangement == -1 and close < prev["close"]):
+        stage = 4
+        confidence = min(0.9, abs(slope30) + abs(diff30) / 10)
+        reason = f"低于30周均线{diff30:.1f}%，斜率{slope30:.3f}(R²={r2_30:.2f})，空头排列，下跌趋势确认"
+
+    elif ((diff30 > 2 and slope30 < 0.05 and r2_30 < 0.6)
+          or (price_change_4w > 10 and rsi > 70)
+          or (diff30 > 8 and vol_ratio > 1.5)):
+        stage = 3
+        confidence = min(0.85, abs(diff30) / 10 + (rsi / 100) + (vol_ratio / 3))
+        reasons = []
+        if diff30 > 2 and slope30 < 0.05:
+            reasons.append(f"均线趋平(斜率{slope30:.3f})")
+        if price_change_4w > 10:
+            reasons.append(f"4周涨幅{price_change_4w:.1f}%")
+        if rsi > 70:
+            reasons.append(f"RSI超买({rsi:.0f})")
+        if vol_ratio > 1.5:
+            reasons.append(f"成交量异常({vol_ratio:.1f}倍)")
+        reason = f"顶部风险信号: {'; '.join(reasons)}"
+
+    elif (diff30 > 1 and diff30 < 8 and slope30 > 0.1 and r2_30 > 0.6
+          and ma_arrangement == 1 and close > prev["close"]
+          and price_change_4w < 12 and rsi < 75):
+        stage = 2
+        confidence = min(0.9, slope30 + diff30 / 10 + r2_30)
+        reason = (f"多头排列，高于30周均线{diff30:.1f}%，"
+                  f"斜率{slope30:.3f}(R²={r2_30:.2f})，RSI={rsi:.0f}，上升趋势健康")
+
+    elif (diff30 < 0 and slope30 > -0.1 and r2_30 < 0.5
+          and vol_ratio < 0.9):
+        stage = 1
+        confidence = min(0.8, (1 - abs(diff30) / 5) + (1 - vol_ratio) + r2_30)
+        reason = f"接近均线(偏离{diff30:.1f}%)，量能萎缩({vol_ratio:.1f}倍)，筑底特征"
+
+    else:
+        stage = 1
+        confidence = 0.4
+        reason = "无明显趋势信号，归为筑底观察期"
+
+    return {
+        "stage": stage,
+        "confidence": round(min(confidence, 1.0), 3),
+        "reason": reason,
+        "key_metrics": {
+            "ma10": float(ma10), "ma20": float(ma20), "ma30": float(ma30),
+            "diff30_pct": round(diff30, 2),
+            "ma30_slope": round(slope30, 4),
+            "ma30_r2": round(r2_30, 3),
+            "ma_arrangement": ma_arrangement,
+            "rsi": round(rsi, 1),
+            "price_change_4w": round(price_change_4w, 2),
+            "vol_ratio": round(vol_ratio, 2),
+        }
+    }
 
 
-def relative_strength(stock_weekly: pd.DataFrame, index_weekly: pd.DataFrame, lookback: int = 12) -> float:
-    aligned = stock_weekly.join(index_weekly[["ret"]], how="inner", rsuffix="_index")
-    if len(aligned) < lookback:
-        return 0.0
-    w = aligned.iloc[-lookback:]
-    s_ret = w["ret"].mean()
-    i_ret = w["ret_index"].mean() if "ret_index" in w.columns else 0.0
-    return float(s_ret - i_ret)
+def relative_strength_enhanced(stock_weekly: pd.DataFrame, index_weekly: pd.DataFrame,
+                                lookback_periods: list = None) -> dict:
+    if lookback_periods is None:
+        lookback_periods = [12, 26, 52]
+    aligned = stock_weekly.join(index_weekly[["ret", "log_ret"]], how="inner", rsuffix="_index")
+    if len(aligned) < min(lookback_periods):
+        return {
+            "rs_scores": {f"{p}周": 0.0 for p in lookback_periods},
+            "win_rates": {f"{p}周": 0.0 for p in lookback_periods},
+            "risk_adjusted_rs": 0.0, "latest_rs": 0.0
+        }
+
+    rs_scores = {}
+    win_rates = {}
+    for lookback in lookback_periods:
+        if len(aligned) < lookback:
+            rs_scores[f"{lookback}周"] = 0.0
+            win_rates[f"{lookback}周"] = 0.0
+            continue
+        window = aligned.iloc[-lookback:]
+        fund_cum = (1 + window["ret"]).prod() - 1
+        index_cum = (1 + window["ret_index"]).prod() - 1
+        rs_scores[f"{lookback}周"] = round(fund_cum - index_cum, 4)
+        win_rates[f"{lookback}周"] = round((window["ret"] > window["ret_index"]).sum() / len(window), 3)
+
+    full = aligned.iloc[-52:] if len(aligned) >= 52 else aligned
+    excess = full["log_ret"] - full["log_ret_index"]
+    risk_adjusted = excess.mean() / excess.std() if excess.std() > 0 else 0.0
+
+    return {
+        "rs_scores": rs_scores,
+        "win_rates": win_rates,
+        "risk_adjusted_rs": round(risk_adjusted, 3),
+        "latest_rs": rs_scores.get("12周", 0.0),
+    }
+
+
+def risk_assessment_stock(weekly_df: pd.DataFrame, risk_free_rate: float = 0.02) -> dict:
+    if len(weekly_df) < 20:
+        return {"max_drawdown": 0.0, "annual_volatility": 0.0, "downside_vol": 0.0, "atr": 0.0, "sharpe_ratio": 0.0}
+
+    roll_max = weekly_df["close"].cummax()
+    drawdown = (weekly_df["close"] / roll_max - 1) * 100
+    max_drawdown = round(drawdown.min(), 2)
+
+    annual_ret = float(weekly_df["ret"].mean() * 52)
+    annual_vol = float(weekly_df["ret"].std() * np.sqrt(52))
+    sharpe = (annual_ret - risk_free_rate) / annual_vol if annual_vol > 0 else 0.0
+
+    downside = weekly_df["ret"][weekly_df["ret"] < 0]
+    downside_vol = round(downside.std() * np.sqrt(52) * 100, 2) if len(downside) > 0 else 0.0
+
+    atr_val = round(float(weekly_df["atr"].iloc[-1]), 4) if "atr" in weekly_df.columns else 0.0
+
+    return {
+        "max_drawdown": max_drawdown,
+        "annual_volatility": round(annual_vol * 100, 2),
+        "downside_vol": downside_vol,
+        "atr": atr_val,
+        "sharpe_ratio": round(sharpe, 3),
+    }
+
+
+def volume_analysis(weekly_df: pd.DataFrame) -> dict:
+    result = {"volume_ok": True, "volume_trend": "normal", "divergence": 0}
+    if "volume" not in weekly_df.columns:
+        return result
+
+    latest_vol = weekly_df.iloc[-1]["volume"]
+    vol_ma20 = weekly_df.iloc[-1]["vol_ma20"]
+    vol_ma5 = weekly_df.iloc[-1]["vol_ma5"]
+
+    vol_ratio = latest_vol / vol_ma20 if vol_ma20 > 0 else 1.0
+
+    vol_percentile = (weekly_df["volume"].rank(pct=True).iloc[-1]) * 100
+
+    result["vol_ratio"] = round(vol_ratio, 2)
+    result["vol_percentile"] = round(vol_percentile, 1)
+    result["volume_ok"] = vol_ratio > 1.3
+
+    if vol_ma5 > vol_ma20 * 1.2:
+        result["volume_trend"] = "放量"
+    elif vol_ma5 < vol_ma20 * 0.8:
+        result["volume_trend"] = "缩量"
+    else:
+        result["volume_trend"] = "正常"
+
+    close = weekly_df["close"]
+    vol_series = weekly_df["volume"]
+    recent_close = close.iloc[-5:]
+    recent_vol = vol_series.iloc[-5:]
+    if len(recent_close) >= 5:
+        close_up = all(recent_close.iloc[i] > recent_close.iloc[i - 1] for i in range(1, 5))
+        vol_down = all(recent_vol.iloc[i] < recent_vol.iloc[i - 1] for i in range(1, 5))
+        if close_up and vol_down:
+            result["divergence"] = -1
+        close_down = all(recent_close.iloc[i] < recent_close.iloc[i - 1] for i in range(1, 5))
+        vol_up = all(recent_vol.iloc[i] > recent_vol.iloc[i - 1] for i in range(1, 5))
+        if close_down and vol_up:
+            result["divergence"] = 1
+
+    return result
 
 
 def detect_breakout(weekly_df: pd.DataFrame, lookback: int = 12, threshold: float = 0.01) -> bool:
-    """向上突破：最近 lookback 周高点被有效突破"""
     if len(weekly_df) < lookback + 1:
         return False
     recent = weekly_df.iloc[-(lookback + 1):-1]
     upper = recent["close"].max()
     latest = weekly_df.iloc[-1]
-    return latest["close"] > upper * (1 + threshold)
+    return bool(latest["close"] > upper * (1 + threshold))
 
 
 def detect_breakdown(weekly_df: pd.DataFrame, threshold: float = 0.01) -> bool:
-    """向下跌破：当前收盘有效跌破支撑位（20 周低点附近）"""
     if len(weekly_df) == 0 or "support" not in weekly_df.columns:
         return False
     latest = weekly_df.iloc[-1]
@@ -186,171 +477,357 @@ def detect_breakdown(weekly_df: pd.DataFrame, threshold: float = 0.01) -> bool:
     close = latest.get("close")
     if pd.isna(support) or pd.isna(close) or support == 0:
         return False
-    return close < support * (1 - threshold)
+    return bool(close < support * (1 - threshold))
 
 
-def generate_advice(
-    stage: int,
-    rs_score: float,
+# ===================== 投资建议生成 =====================
+
+def generate_advice_enhanced(
+    stage_info: dict,
+    rs_info: dict,
+    risk_info: dict,
+    vol_info: dict,
     breakout: bool,
-    volume_ok: bool,
-    breakdown: bool = False,
-    rs_threshold: float = 0.005  # 相对强度临界值（微弱正/负的区分）
+    breakdown: bool,
+    weekly_df: pd.DataFrame
 ) -> dict:
-    """
-    生成投资建议，基于阶段、相对强度、突破、量能多维度判断
-    :param stage: 股票阶段（1:筑底, 2:上升, 3:顶部, 4:下跌）
-    :param rs_score: 相对强度（股票-指数周度收益率均值）
-    :param breakout: 是否向上突破阻力位
-    :param volume_ok: 量能是否放大（突破时成交量>近12周均值1.5倍）
-    :param breakdown: 是否向下跌破支撑位
-    :param rs_threshold: 相对强度临界值，区分「微弱正/负」
-    :return: 包含建议、说明、评分的字典
-    """
-    # === 核心逻辑：按「趋势阶段→强弱信号→量能/突破」分层 ===
-    # 1. 第二阶段（上升趋势）：核心分「强势/中性/弱势」
-    if stage == 2:
-        # 1.1 强势：上升+跑赢指数+突破+放量 → 买入
-        if rs_score > rs_threshold and breakout and volume_ok:
-            action = "买入"
-            note = "第二阶段（上升趋势）：跑赢指数+放量突破阻力位，建议分批建仓（优先左侧1/3仓位，回踩均线补仓）"
-            score = 85
-        # 1.2 中性1：上升+跑赢指数+突破但缩量 → 观望（等待回踩确认）
-        elif rs_score > rs_threshold and breakout and not volume_ok:
-            action = "观望"
-            note = "第二阶段（上升趋势）：跑赢指数+突破阻力位，但量能未放大，等待回踩30周均线确认后再建仓"
-            score = 70
-        # 1.3 中性2：上升+跑赢指数但未突破 → 观望（等待突破/回踩）
-        elif rs_score > rs_threshold and not breakout:
-            action = "观望"
-            note = "第二阶段（上升趋势）：跑赢指数，但未突破阻力位，可等待突破或回踩30周均线后布局"
-            score = 65
-        # 1.4 弱势1：上升但跑输指数（微弱负）+ 突破 → 观望（警惕补跌）
-        elif abs(rs_score) <= rs_threshold and breakout:
-            action = "观望"
-            note = "第二阶段（上升趋势）：相对强度接近0+突破阻力位，暂观望，待rs转正且量能放大后再介入"
-            score = 60
-        # 1.5 弱势2：上升但明显跑输指数 → 观望（优先换更强标的）
-        else:
-            action = "观望"
-            note = f"第二阶段（上升趋势）：但相对强度为{rs_score:.4f}（跑输指数），建议观望，优先选择跑赢指数的标的"
-            score = 55
+    stage = stage_info["stage"]
+    confidence = stage_info["confidence"]
+    km = stage_info.get("key_metrics", {})
 
-    # 2. 第一阶段（筑底期）：仅观望，等待趋势确认
-    elif stage == 1:
+    rs_scores = rs_info.get("rs_scores", {})
+    rs_latest = rs_info.get("latest_rs", 0.0)
+    win_rate = rs_info.get("win_rates", {}).get("12周", 0.0)
+    risk_adjusted_rs = rs_info.get("risk_adjusted_rs", 0.0)
+
+    max_dd = risk_info.get("max_drawdown", 0.0)
+    volatility = risk_info.get("annual_volatility", 0.0)
+    atr_val = risk_info.get("atr", 0.0)
+
+    rsi = km.get("rsi", 50.0)
+    diff30 = km.get("diff30_pct", 0.0)
+    price_change_4w = km.get("price_change_4w", 0.0)
+    vol_ratio = km.get("vol_ratio", 1.0)
+    vol_ok = vol_info.get("volume_ok", True)
+    vol_divergence = vol_info.get("divergence", 0)
+
+    base_scores = {0: 30, 1: 45, 2: 65, 3: 35, 4: 15}
+    base_score = base_scores.get(stage, 30)
+
+    enhancement_score = 0
+    enhancement_factors = []
+
+    if rs_latest > 0.08:
+        enhancement_score += 10
+        enhancement_factors.append(f"相对强度优秀(+10)")
+    elif rs_latest > 0.03:
+        enhancement_score += 6
+        enhancement_factors.append(f"相对强度良好(+6)")
+    elif rs_latest > 0.005:
+        enhancement_score += 3
+        enhancement_factors.append(f"相对强度偏正(+3)")
+    elif rs_latest < -0.05:
+        enhancement_score -= 8
+        enhancement_factors.append(f"相对强度较弱(-8)")
+
+    if win_rate > 0.6:
+        enhancement_score += 5
+        enhancement_factors.append(f"胜率较高(+5)")
+    elif win_rate > 0.5:
+        enhancement_score += 2
+        enhancement_factors.append(f"胜率中性(+2)")
+    elif win_rate < 0.4:
+        enhancement_score -= 3
+        enhancement_factors.append(f"胜率偏低(-3)")
+
+    if risk_adjusted_rs > 0.5:
+        enhancement_score += 8
+        enhancement_factors.append(f"风险调整收益优秀(+8)")
+    elif risk_adjusted_rs > 0.2:
+        enhancement_score += 4
+        enhancement_factors.append(f"风险调整收益良好(+4)")
+
+    if breakout and vol_ok:
+        enhancement_score += 10
+        enhancement_factors.append(f"放量突破(+10)")
+    elif breakout and not vol_ok:
+        enhancement_score += 3
+        enhancement_factors.append(f"缩量突破(+3)")
+
+    risk_score = 0
+    risk_factors = []
+
+    if max_dd < -30:
+        risk_score -= 25
+        risk_factors.append(f"最大回撤极大(-25)")
+    elif max_dd < -20:
+        risk_score -= 18
+        risk_factors.append(f"最大回撤过大(-18)")
+    elif max_dd < -10:
+        risk_score -= 8
+        risk_factors.append(f"回撤较大(-8)")
+    elif max_dd > -5:
+        risk_score += 10
+        risk_factors.append(f"回撤控制优秀(+10)")
+
+    if rsi > 75:
+        risk_score -= 10
+        risk_factors.append(f"RSI超买(-10)")
+    elif rsi > 70:
+        risk_score -= 5
+        risk_factors.append(f"RSI偏高(-5)")
+    elif rsi < 25:
+        risk_score += 5
+        risk_factors.append(f"RSI超卖(+5)")
+
+    if abs(diff30) > 10:
+        risk_score -= 6
+        risk_factors.append(f"远离均线(-6)")
+    elif abs(diff30) > 6:
+        risk_score -= 3
+
+    if vol_divergence == -1:
+        risk_score -= 8
+        risk_factors.append(f"量价顶背离(-8)")
+    elif vol_divergence == 1:
+        risk_score += 5
+        risk_factors.append(f"量价底背离(+5)")
+
+    if breakdown:
+        risk_score -= 15
+        risk_factors.append(f"跌破支撑(-15)")
+
+    if volatility > 40:
+        risk_score -= 5
+        risk_factors.append(f"高波动(-5)")
+
+    final_score = base_score + enhancement_score + risk_score
+    final_score = max(0, min(100, final_score))
+
+    if final_score >= 80:
+        action = "买入"
+        suggested_position = 60
+    elif final_score >= 65:
+        action = "买入"
+        suggested_position = 45
+    elif final_score >= 50:
+        action = "谨慎买入"
+        suggested_position = 30
+    elif final_score >= 35:
         action = "观望"
-        note = "第一阶段（筑底期）：股价在均线下方+均线斜率向下，等待周线突破30周均线且均线走升后再关注"
-        score = 60
-
-    # 3. 第三阶段（顶部期）：分「强顶/弱顶」
-    elif stage == 3:
-        # 3.1 顶部但仍跑赢指数 → 减仓（分批止盈）
-        if rs_score > rs_threshold:
-            action = "减仓"
-            note = "第三阶段（顶部趋势）：股价在均线上但均线斜率向下+仍跑赢指数，建议分批减仓（先减1/2仓位）"
-            score = 45
-        # 3.2 顶部且跑输指数 → 重仓减仓
-        else:
-            action = "减仓"
-            note = f"第三阶段（顶部趋势）：股价在均线上但均线斜率向下+跑输指数（rs={rs_score:.4f}），建议减仓至1/3以下"
-            score = 40
-
-    # 4. 第四阶段（下跌趋势）：分「极端弱势/普通弱势」
-    elif stage == 4:
-        # 4.1 下跌但尚未有效跌破支撑 → 止损（小仓位）
-        if not breakdown:
-            action = "止损"
-            note = "第四阶段（下跌趋势）：股价在均线下方+均线斜率向下，建议严格设置止损和仓位，避免进一步亏损"
-            score = 25
-        # 4.2 下跌且有效跌破支撑 → 清仓
-        else:
-            action = "清仓"
-            note = "第四阶段（下跌趋势）：股价有效跌破支撑位+均线向下，建议立即清仓，避免深度套牢"
-            score = 15
-
-    # 5. 异常阶段（如阶段值错误）：兜底观望
+        suggested_position = 15
+    elif final_score >= 20:
+        action = "减仓"
+        suggested_position = 5
     else:
-        action = "观望"
-        note = f"阶段值异常（stage={stage}），暂无法判断趋势，建议观望"
-        score = 50
+        action = "清仓"
+        suggested_position = 0
+
+    note_parts = []
+    stage_names = {0: "未知", 1: "筑底期", 2: "上升期", 3: "顶部期", 4: "下跌期"}
+    stage_name = stage_names.get(stage, "未知")
+    note_parts.append(f"第{stage}阶段（{stage_name}）")
+
+    if stage == 2:
+        if final_score >= 65:
+            if enhancement_factors:
+                note_parts.append("趋势健康，" + "；".join(enhancement_factors[:2]))
+            note_parts.append("建议分批建仓，回踩30周均线补仓")
+        else:
+            note_parts.append("上升趋势但信号偏弱，建议等待更明确信号")
+    elif stage == 4:
+        note_parts.append("下跌趋势，注意风险控制")
+        if breakdown:
+            note_parts.append("已跌破支撑，建议立即止损")
+        else:
+            note_parts.append("建议严格设置止损")
+    elif stage == 3:
+        note_parts.append("顶部区域，" + ("建议分批减仓" if final_score < 40 else "谨慎持有，设置止盈"))
+    elif stage == 1:
+        note_parts.append("筑底阶段，等待趋势明确")
+
+    if risk_factors:
+        note_parts.append("风险：" + "；".join(risk_factors[:2]))
 
     return {
         "建议": action,
-        "说明": note,
-        "评分": score,
-        "关键参数": {  # 补充参数便于复盘
+        "说明": "。".join(note_parts),
+        "评分": final_score,
+        "建议仓位(%)": suggested_position,
+        "评分详情": {
+            "基础分数": base_score,
+            "增强分数": enhancement_score,
+            "风险分数": risk_score,
+            "最终分数": final_score,
+            "增强因子": enhancement_factors,
+            "风险因子": risk_factors,
+        },
+        "关键参数": {
             "阶段": stage,
-            "相对强度": round(rs_score, 4),
+            "阶段置信度": confidence,
+            "相对强度": round(rs_latest, 4),
+            "多周期相对强度": rs_scores,
+            "胜率": win_rate,
+            "风险调整超额": risk_adjusted_rs,
             "是否突破": breakout,
-            "量能是否放大": volume_ok,
+            "量能状态": vol_ok,
+            "量价比率": vol_ratio,
             "是否跌破支撑": breakdown,
+            "RSI": rsi,
+            "均线偏离%": diff30,
+            "4周涨幅%": price_change_4w,
+            "最大回撤%": max_dd,
+            "年化波动率%": volatility,
         }
     }
 
 
+def generate_trading_strategy(
+    advice: dict,
+    weekly_df: pd.DataFrame,
+    support: float,
+    resistance: float
+) -> dict:
+    action = advice["建议"]
+    suggested_position = advice.get("建议仓位(%)", 0)
+    latest_close = float(weekly_df.iloc[-1]["close"])
+    atr_val = float(weekly_df["atr"].iloc[-1]) if "atr" in weekly_df.columns else latest_close * 0.05
+
+    strategy = {
+        "建议仓位(%)": suggested_position,
+        "当前价": round(latest_close, 2),
+        "分批买入": [],
+        "止损位": round(latest_close - atr_val * 2, 2),
+        "目标位": round(latest_close + atr_val * 3, 2),
+    }
+
+    if action in ("买入", "谨慎买入") and suggested_position > 0:
+        batches = []
+        if suggested_position >= 40:
+            batches.append({"批次": 1, "比例": 50, "条件": f"当前价{latest_close:.2f}附近"})
+            batches.append({"批次": 2, "比例": 30, "条件": f"回踩30周均线{weekly_df.iloc[-1]['ma30']:.2f}附近"})
+            batches.append({"批次": 3, "比例": 20, "条件": f"放量突破阻力位{resistance:.2f}加仓"})
+        elif suggested_position >= 20:
+            batches.append({"批次": 1, "比例": 60, "条件": f"当前价{latest_close:.2f}附近"})
+            batches.append({"批次": 2, "比例": 40, "条件": f"回踩30周均线{weekly_df.iloc[-1]['ma30']:.2f}加仓"})
+        else:
+            batches.append({"批次": 1, "比例": 100, "条件": f"当前价{latest_close:.2f}附近试探性建仓"})
+        strategy["分批买入"] = batches
+
+    ma30 = weekly_df.iloc[-1]["ma30"]
+    strategy["止损位"] = round(min(support * 0.98, latest_close - atr_val * 2), 2)
+    strategy["目标位"] = round(max(resistance * 1.05, latest_close + atr_val * 3), 2)
+
+    if action == "买入":
+        strategy["加仓条件"] = "RS持续为正 + 回踩MA30不破 + 放量突破前高"
+        strategy["减仓条件"] = f"跌破止损位{strategy['止损位']} 或 RSI>80 或 相对强度转负"
+    elif action in ("减仓", "清仓"):
+        strategy["减仓条件"] = "建议按计划减仓，反弹至均线附近是较好的减仓时机"
+    else:
+        strategy["加仓条件"] = "等待趋势明确（突破阻力位+RS转正+量能放大）"
+        strategy["减仓条件"] = f"跌破支撑位{support:.2f}应考虑止损"
+
+    return strategy
+
+
+# ===================== 主分析函数 =====================
+
 def analyze_stock(stock_code: str) -> dict:
-    """分析单个股票"""
     try:
         info = fetch_stock_info(stock_code)
         weekly = fetch_stock_weekly(stock_code)
-        # 数据不足时直接给出提示，避免后续计算异常
+
         if weekly is None or len(weekly) < 40:
             return {
                 "股票代码": stock_code,
                 "股票名称": info.get("股票简称") or info.get("股票名称", ""),
                 "分析日期": datetime.today().strftime("%Y-%m-%d"),
-                "最新收盘": np.nan,
-                "30周均值": np.nan,
-                "阶段": np.nan,
-                "相对强度": np.nan,
-                "是否突破": False,
-                "量能是否放大": False,
-                "支撑位": np.nan,
-                "阻力位": np.nan,
-                "止损建议": np.nan,
-                "投资建议": "",
-                "投资说明": "历史数据不足，暂无法进行有效分析",
-                "投资评分": np.nan,
-                "错误信息": "历史数据不足"
+                "最新收盘": np.nan, "30周均值": np.nan,
+                "阶段": np.nan, "相对强度": np.nan,
+                "是否突破": False, "量能是否放大": False,
+                "支撑位": np.nan, "阻力位": np.nan, "止损建议": np.nan,
+                "投资建议": "", "投资说明": "历史数据不足，暂无法进行有效分析",
+                "投资评分": np.nan, "错误信息": "历史数据不足"
             }
 
         index_weekly = fetch_index_weekly_close("sh000300")
-        stage = judge_stage(weekly)
-        rs = relative_strength(weekly, index_weekly, 12) if len(index_weekly) > 0 else 0.0
-        breakout_up = bool(detect_breakout(weekly, 12, 0.01))
-        breakdown = bool(detect_breakdown(weekly, 0.01))
-        vol_ok = True
 
-        if "volume" in weekly.columns and breakout_up:
-            recent = weekly.iloc[-13:-1]
-            vol_mean = recent["volume"].mean()
-            vol_ok = bool(weekly.iloc[-1]["volume"] > vol_mean * 1.5)
+        stage_info = judge_stage_enhanced(weekly)
+        rs_info = relative_strength_enhanced(weekly, index_weekly) if len(index_weekly) > 0 else None
+        risk_info = risk_assessment_stock(weekly)
+        vol_info = volume_analysis(weekly)
 
-        advice = generate_advice(stage, rs, breakout_up, vol_ok, breakdown)
+        breakout_up = detect_breakout(weekly, 12, 0.01)
+        breakdown = detect_breakdown(weekly, 0.01)
+
+        if rs_info is None:
+            rs_info = {
+                "rs_scores": {}, "win_rates": {},
+                "risk_adjusted_rs": 0.0, "latest_rs": 0.0
+            }
+
+        advice = generate_advice_enhanced(
+            stage_info, rs_info, risk_info, vol_info,
+            breakout_up, breakdown, weekly
+        )
+
         latest_close = float(weekly.iloc[-1]["close"])
-        latest_ma = float(weekly.iloc[-1]["ma30"])
+        latest_ma30 = float(weekly.iloc[-1]["ma30"])
         support = float(weekly.iloc[-1]["support"])
         resistance = float(weekly.iloc[-1]["resistance"])
+        rsi_val = float(weekly.iloc[-1].get("rsi", 50))
+
         integer_price = np.floor(support)
         stop_loss = (integer_price - 0.05) if support > integer_price else (support - 0.05)
 
-        # 整理结果为扁平结构，方便写入CSV
+        recent_5_weeks = []
+        for date, row in weekly.iloc[-5:].iterrows():
+            close_p = row["close"]
+            ma30_p = row["ma30"]
+            gap_pct = ((close_p - ma30_p) / ma30_p * 100) if pd.notna(ma30_p) and ma30_p > 0 else 0.0
+            recent_5_weeks.append({
+                "date": date.strftime("%Y-%m-%d"),
+                "close": close_p,
+                "ma30": ma30_p,
+                "gap_pct": gap_pct
+            })
+
+        strategy = generate_trading_strategy(advice, weekly, support, resistance)
+
         result = {
             "股票代码": stock_code,
             "股票名称": info.get("股票简称") or info.get("股票名称", ""),
             "分析日期": datetime.today().strftime("%Y-%m-%d"),
             "最新收盘": latest_close,
-            "30周均值": latest_ma,
-            "阶段": stage,
-            "相对强度": rs,
+            "30周均值": latest_ma30,
+            "阶段": stage_info["stage"],
+            "阶段置信度": stage_info["confidence"],
+            "阶段说明": stage_info["reason"],
+            "相对强度": round(rs_info["latest_rs"], 4),
+            "多周期相对强度": rs_info["rs_scores"],
+            "胜率": rs_info["win_rates"],
+            "风险调整超额收益": rs_info["risk_adjusted_rs"],
             "是否突破": breakout_up,
-            "量能是否放大": vol_ok,
+            "量能是否放大": vol_info.get("volume_ok", True),
+            "量价比率": vol_info.get("vol_ratio", 1.0),
+            "量能趋势": vol_info.get("volume_trend", "normal"),
+            "量价背离": vol_info.get("divergence", 0),
+            "RSI": rsi_val,
             "支撑位": support,
             "阻力位": resistance,
             "止损建议": stop_loss,
+            "最大回撤%": risk_info["max_drawdown"],
+            "年化波动率%": risk_info["annual_volatility"],
+            "ATR": risk_info["atr"],
+            "夏普比率": risk_info["sharpe_ratio"],
             "投资建议": advice["建议"],
             "投资说明": advice["说明"],
             "投资评分": advice["评分"],
+            "建议仓位(%)": advice.get("建议仓位(%)", 0),
+            "评分详情": advice.get("评分详情", {}),
+            "关键参数": advice.get("关键参数", {}),
+            "交易策略": strategy,
+            "近五周均线差距": recent_5_weeks,
             "错误信息": ""
         }
 
@@ -361,18 +838,113 @@ def analyze_stock(stock_code: str) -> dict:
             "股票代码": stock_code,
             "股票名称": info.get("股票简称") or info.get("股票名称", "") if "info" in locals() else "",
             "分析日期": datetime.today().strftime("%Y-%m-%d"),
-            "最新收盘": np.nan,
-            "30周均值": np.nan,
-            "阶段": np.nan,
-            "相对强度": np.nan,
-            "是否突破": False,
-            "量能是否放大": False,
-            "支撑位": np.nan,
-            "阻力位": np.nan,
-            "止损建议": np.nan,
-            "投资建议": "",
-            "投资说明": "",
-            "投资评分": np.nan,
+            "最新收盘": np.nan, "30周均值": np.nan,
+            "阶段": np.nan, "相对强度": np.nan,
+            "是否突破": False, "量能是否放大": False,
+            "支撑位": np.nan, "阻力位": np.nan, "止损建议": np.nan,
+            "投资建议": "", "投资说明": "", "投资评分": np.nan,
             "错误信息": f"分析出错: {str(e)}"
         }
 
+
+# ===================== 回测模块 =====================
+
+def backtest_stock_strategy(stock_code: str, years: int = 3, min_history: int = 60) -> dict:
+    weekly = fetch_stock_weekly(stock_code, years)
+    if len(weekly) < min_history + 10:
+        return {"错误": f"数据不足，至少需要{min_history + 10}周数据"}
+
+    index_weekly = fetch_index_weekly_close("sh000300")
+    if len(index_weekly) == 0:
+        return {"错误": "无法获取基准指数数据"}
+
+    signals = []
+    total_weeks = len(weekly)
+
+    for i in range(min_history, total_weeks):
+        historical = weekly.iloc[:i + 1]
+        hist_index = index_weekly[index_weekly.index.isin(historical.index)]
+
+        stage_info = judge_stage_enhanced(historical)
+        rs_info = relative_strength_enhanced(historical, hist_index) if len(hist_index) > 0 else None
+        risk_info = risk_assessment_stock(historical)
+        vol_info = volume_analysis(historical)
+
+        if rs_info is None:
+            rs_info = {"rs_scores": {}, "win_rates": {}, "risk_adjusted_rs": 0.0, "latest_rs": 0.0}
+
+        advice = generate_advice_enhanced(
+            stage_info, rs_info, risk_info, vol_info,
+            detect_breakout(historical),
+            detect_breakdown(historical),
+            historical
+        )
+
+        current_close = float(historical.iloc[-1]["close"])
+
+        forward_ret = {}
+        for fwd in [4, 8, 12]:
+            if i + fwd < total_weeks:
+                fwd_close = float(weekly.iloc[i + fwd]["close"])
+                forward_ret[f"{fwd}周"] = (fwd_close / current_close - 1) * 100
+            else:
+                forward_ret[f"{fwd}周"] = None
+
+        signals.append({
+            "date": historical.index[-1],
+            "close": current_close,
+            "stage": stage_info["stage"],
+            "confidence": stage_info["confidence"],
+            "action": advice["建议"],
+            "score": advice["评分"],
+            "position": advice.get("建议仓位(%)", 0),
+            "rs": rs_info["latest_rs"],
+            **forward_ret
+        })
+
+    df = pd.DataFrame(signals)
+    if len(df) == 0:
+        return {"错误": "回测未产生有效信号"}
+
+    buy_signals = df[df["action"].isin(["买入", "谨慎买入"])]
+    sell_signals = df[df["action"].isin(["减仓", "清仓", "止损"])]
+
+    stats_result = {"总交易周数": len(df)}
+
+    for fwd in ["4周", "8周", "12周"]:
+        col = f"{fwd}收益%"
+        valid = buy_signals[buy_signals[f"{fwd}周"].notna()]
+        if len(valid) == 0:
+            stats_result[f"买入信号{fwd}胜率"] = np.nan
+            stats_result[f"买入信号{fwd}平均收益%"] = np.nan
+            continue
+        wins = (valid[f"{fwd}周"] > 0).sum()
+        stats_result[f"买入信号{fwd}胜率"] = round(wins / len(valid) * 100, 1)
+        stats_result[f"买入信号{fwd}平均收益%"] = round(valid[f"{fwd}周"].mean(), 2)
+
+    for fwd in ["4周", "8周", "12周"]:
+        col = f"{fwd}收益%"
+        valid = sell_signals[sell_signals[f"{fwd}周"].notna()]
+        if len(valid) == 0:
+            continue
+        correct = (valid[f"{fwd}周"] < 0).sum()
+        stats_result[f"卖出信号{fwd}准确率"] = round(correct / len(valid) * 100, 1)
+
+    score_bins = [0, 20, 40, 60, 80, 100]
+    score_labels = ["0-20", "20-40", "40-60", "60-80", "80-100"]
+    df["评分分组"] = pd.cut(df["score"], bins=score_bins, labels=score_labels)
+    for label in score_labels:
+        group = df[df["评分分组"] == label]
+        if len(group) > 0:
+            valid_8w = group[group["8周"].notna()]
+            if len(valid_8w) > 0:
+                stats_result[f"评分{label}信号数"] = len(group)
+                stats_result[f"评分{label}8周胜率"] = round((valid_8w["8周"] > 0).sum() / len(valid_8w) * 100, 1)
+                stats_result[f"评分{label}8周平均收益%"] = round(valid_8w["8周"].mean(), 2)
+
+    latest_stage = stage_info["stage"] if signals else "未知"
+    return {
+        "回测概要": stats_result,
+        "信号明细": df,
+        "最新阶段": latest_stage,
+    }
