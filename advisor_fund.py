@@ -528,6 +528,7 @@ def backtest_fund_strategy(fund_code: str, benchmark_code: str = "sh000300", yea
     positions = []
     strat_ret = []
     regime_history = []
+    signal_details = []
 
     for i in range(start_idx, len(dates) - 1):
         end_date = dates[i]
@@ -559,6 +560,27 @@ def backtest_fund_strategy(fund_code: str, benchmark_code: str = "sh000300", yea
         positions.append(pos)
         strat_ret.append(pos * r)
         regime_history.append(regime["regime"])
+
+        # 收集ML训练用的特征数据
+        km = fuzzy.get("key_metrics", {})
+        total_weeks = len(dates)
+        fwd_ret_8w = None
+        if i + 9 < total_weeks:
+            fwd_close = fund_weekly.loc[dates[i + 9], "close"]
+            fwd_ret_8w = (fwd_close / current_price - 1) * 100
+
+        signal_details.append({
+            "diff30_pct": km.get("diff30_pct", 0),
+            "diff10_pct": km.get("diff10_pct", 0),
+            "ma30_slope": km.get("ma30_slope", 0),
+            "ma30_r2": km.get("ma30_r2", 0),
+            "rsi": km.get("rsi", 50),
+            "ret_4w": km.get("ret_4w", 0),
+            "ret_8w": km.get("ret_8w", 0),
+            "ma_arrangement": km.get("ma_arrangement", 0),
+            "vol_ratio": km.get("vol_ratio", 1.0),
+            "8周": fwd_ret_8w,
+        })
 
     strat_ret_series = pd.Series(strat_ret, index=dates[start_idx + 1:])
 
@@ -605,7 +627,8 @@ def backtest_fund_strategy(fund_code: str, benchmark_code: str = "sh000300", yea
                 summary[f"市场_{r}_周数"] = len(subset)
 
     equity_df = pd.DataFrame({"策略净值": equity})
-    return {"基金代码": fund_code, "回测概要": summary, "净值曲线": equity_df}
+    signal_df = pd.DataFrame(signal_details)
+    return {"基金代码": fund_code, "回测概要": summary, "净值曲线": equity_df, "信号明细": signal_df}
 
 
 # ===================== 主分析函数 =====================

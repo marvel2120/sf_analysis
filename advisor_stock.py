@@ -2,7 +2,6 @@ from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 import akshare as ak
-from scipy import stats
 import warnings
 
 # 从共享模块导入通用工具函数（消除重复代码）
@@ -13,7 +12,36 @@ from market_utils import (
     risk_assessment as risk_assessment_market,  # 保留原名用于兼容
     detect_market_regime
 )
+from deepseek_integration import DeepSeekClient
+from ml_classifier import MLStageClassifier
+import config as cfg
 warnings.filterwarnings('ignore')
+
+# ===================== 全局初始化 =====================
+_deepseek_client = None
+_ml_classifier = None
+
+
+def get_ml_classifier() -> MLStageClassifier:
+    global _ml_classifier
+    if _ml_classifier is None:
+        _ml_classifier = MLStageClassifier(
+            min_samples=cfg.ML_CONFIG.get('min_samples', 80),
+            model_type=cfg.ML_CONFIG.get('model_type', 'xgb')
+        )
+    return _ml_classifier
+
+
+def get_deepseek_client() -> DeepSeekClient:
+    global _deepseek_client
+    if _deepseek_client is None:
+        _deepseek_client = DeepSeekClient(
+            api_key=cfg.DEEPSEEK_CONFIG.get('api_key', ''),
+            model=cfg.DEEPSEEK_CONFIG.get('model', 'deepseek-chat'),
+            timeout=cfg.DEEPSEEK_CONFIG.get('timeout', 15)
+        )
+    return _deepseek_client
+
 
 # ===================== 基础数据获取 =====================
 
@@ -160,122 +188,6 @@ def fetch_stock_weekly(stock_code: str, years: int = 5) -> pd.DataFrame:
     return weekly
 
 
-def fetch_index_weekly_close(index_symbol: str = "sh000300", years: int = 3) -> pd.DataFrame:
-    if ak is None:
-        return pd.DataFrame()
-    end_date = datetime.now().strftime("%Y%m%d")
-    start_date = (datetime.now() - timedelta(days=365 * years)).strftime("%Y%m%d")
-    df = None
-    try:
-        df = ak.stock_zh_index_daily(symbol=index_symbol, start_date=start_date, end_date=end_date)
-    except Exception:
-        df = None
-    if df is None or len(df) == 0:
-        try:
-            code = index_symbol.replace("sh", "").replace("sz", "")
-            df = ak.index_zh_a_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date)
-        except Exception:
-            df = None
-    if df is None or len(df) == 0:
-        return pd.DataFrame()
-    if "日期" in df.columns:
-        df["date"] = pd.to_datetime(df["日期"])
-    elif "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"])
-    else:
-        return pd.DataFrame()
-    price_col = "收盘" if "收盘" in df.columns else ("close" if "close" in df.columns else None)
-    if price_col is None:
-        return pd.DataFrame()
-    df[price_col] = pd.to_numeric(df[price_col], errors="coerce")
-    df = df.sort_values("date")
-    df = df.set_index("date")
-    weekly = df[[price_col]].resample("W-FRI").last().dropna()
-    weekly = weekly.rename(columns={price_col: "close"})
-    weekly["ret"] = weekly["close"].pct_change()
-    weekly["log_ret"] = np.log(weekly["close"] / weekly["close"].shift(1))
-    weekly = weekly.dropna()
-    return weekly
-
-
-# ===================== 技术指标计算 =====================
-
-def compute_ma_slope(series: pd.Series, window: int = 10) -> tuple:
-    s = series.dropna()
-    if len(s) < window:
-        return 0.0, 0.0
-    x = np.arange(window)
-    y = s.iloc[-window:].to_numpy()
-    slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
-    slope_normalized = slope / s.iloc[-window:].mean() * 100
-    return float(slope_normalized), float(r_value ** 2)
-
-
-def compute_rsi_series(prices: pd.Series, period: int = 14) -> pd.Series:
-    delta = prices.diff()
-    gains = delta.where(delta > 0, 0.0)
-    losses = -delta.where(delta < 0, 0.0)
-    avg_gains = gains.rolling(window=period, min_periods=period).mean()
-    avg_losses = losses.rolling(window=period, min_periods=period).mean()
-    rs = avg_gains / avg_losses.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-
-def calculate_rsi(prices: pd.Series, period: int = 14) -> float:
-    rsi_series = compute_rsi_series(prices, period)
-    val = rsi_series.iloc[-1] if len(rsi_series) > 0 else 50.0
-    return float(val) if not pd.isna(val) else 50.0
-
-
-def compute_macd(prices: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> dict:
-    ema_fast = prices.ewm(span=fast, adjust=False).mean()
-    ema_slow = prices.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    histogram = macd_line - signal_line
-    return {"macd": macd_line, "signal": signal_line, "histogram": histogram}
-
-
-def compute_bollinger_bands(prices: pd.Series, window: int = 20, num_std: float = 2.0) -> dict:
-    middle = prices.rolling(window).mean()
-    std = prices.rolling(window).std()
-    upper = middle + num_std * std
-    lower = middle - num_std * std
-    return {"upper": upper, "lower": lower, "middle": middle}
-
-
-def compute_atr(weekly_df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high = weekly_df["high"]
-    low = weekly_df["low"]
-    close = weekly_df["close"]
-    prev_close = close.shift(1)
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(window=period, min_periods=period).mean()
-    return atr
-
-
-def compute_macd_divergence(macd_histogram: pd.Series, prices: pd.Series, lookback: int = 10) -> int:
-    recent_prices = prices.iloc[-lookback:]
-    recent_macd = macd_histogram.iloc[-lookback:]
-    if len(recent_prices) < lookback or len(recent_macd) < lookback:
-        return 0
-    price_high = recent_prices.max()
-    price_low = recent_prices.min()
-    macd_high = recent_macd.max()
-    macd_low = recent_macd.min()
-    latest_price = recent_prices.iloc[-1]
-    latest_macd = recent_macd.iloc[-1]
-    if latest_price >= price_high * 0.98 and latest_macd <= macd_high * 0.5:
-        return -1
-    if latest_price <= price_low * 1.02 and latest_macd >= macd_low * 0.5:
-        return 1
-    return 0
-
-
 # ===================== 核心分析 =====================
 
 def judge_stage_enhanced(weekly_df: pd.DataFrame) -> dict:
@@ -355,11 +267,14 @@ def judge_stage_enhanced(weekly_df: pd.DataFrame) -> dict:
         "key_metrics": {
             "ma10": float(ma10), "ma20": float(ma20), "ma30": float(ma30),
             "diff30_pct": round(diff30, 2),
+            "diff10_pct": round(diff10, 2),
             "ma30_slope": round(slope30, 4),
             "ma30_r2": round(r2_30, 3),
             "ma_arrangement": ma_arrangement,
             "rsi": round(rsi, 1),
             "price_change_4w": round(price_change_4w, 2),
+            "ret_4w": round(price_change_4w, 2),
+            "ret_8w": round(price_change_8w, 2),
             "vol_ratio": round(vol_ratio, 2),
         }
     }
@@ -780,6 +695,47 @@ def analyze_stock(stock_code: str) -> dict:
             breakout_up, breakdown, weekly
         )
 
+        # Market regime
+        market_regime = detect_market_regime(index_weekly) if len(index_weekly) > 0 else {"regime": "unknown", "score": 0, "description": "数据不足"}
+
+        # ML 分类器预测（如果已训练）
+        ml_fused = None
+        stock_cfg = cfg.ANALYSIS_CONFIG.get('fund', {})
+        if stock_cfg.get('enable_ml', True) and cfg.ML_CONFIG.get('enabled', True):
+            try:
+                classifier = get_ml_classifier()
+                if classifier.available:
+                    ml_pred = classifier.predict_stage(stage_info.get("key_metrics", {}))
+                    fused = classifier.fuse_with_rules(
+                        stage_info, ml_pred,
+                        ml_weight=cfg.ML_CONFIG.get('ml_weight', 0.3)
+                    )
+                    if fused.get("confidence", 0) > stage_info.get("confidence", 0) * 1.2:
+                        print(f"  [ML] 股票{stock_code}: 融合后阶段 {fused['stage']} "
+                              f"置信度 {fused['confidence']:.2%}")
+                    ml_fused = fused
+            except Exception as e:
+                print(f"  [ML] 预测失败: {e}")
+
+        # DeepSeek AI 交叉验证
+        deepseek_result = None
+        stock_cfg = cfg.ANALYSIS_CONFIG.get('fund', {})
+        ds_client = get_deepseek_client()
+        if stock_cfg.get('enable_deepseek', True) and ds_client.available:
+            try:
+                km = stage_info.get("key_metrics", {})
+                deepseek_result = ds_client.validate_signal(
+                    stage_info["stage"],
+                    stage_info["confidence"],
+                    km,
+                    market_regime=market_regime["regime"]
+                )
+                if deepseek_result and deepseek_result.get("deepseek_opinion"):
+                    opinion = deepseek_result["deepseek_opinion"]
+                    print(f"  [DeepSeek] 股票{stock_code}: {'同意' if opinion.get('agree') else '不同意'}系统判断")
+            except Exception as e:
+                print(f"  [DeepSeek] 调用失败: {e}")
+
         latest_close = float(weekly.iloc[-1]["close"])
         latest_ma30 = float(weekly.iloc[-1]["ma30"])
         support = float(weekly.iloc[-1]["support"])
@@ -837,6 +793,8 @@ def analyze_stock(stock_code: str) -> dict:
             "关键参数": advice.get("关键参数", {}),
             "交易策略": strategy,
             "近五周均线差距": recent_5_weeks,
+            "市场状态分析": market_regime,
+            "DeepSeek分析": deepseek_result["deepseek_opinion"] if deepseek_result and deepseek_result.get("deepseek_opinion") else None,
             "错误信息": ""
         }
 
@@ -899,6 +857,7 @@ def backtest_stock_strategy(stock_code: str, years: int = 3, min_history: int = 
             else:
                 forward_ret[f"{fwd}周"] = None
 
+        km = stage_info.get("key_metrics", {})
         signals.append({
             "date": historical.index[-1],
             "close": current_close,
@@ -908,6 +867,16 @@ def backtest_stock_strategy(stock_code: str, years: int = 3, min_history: int = 
             "score": advice["评分"],
             "position": advice.get("建议仓位(%)", 0),
             "rs": rs_info["latest_rs"],
+            # ML 特征列
+            "diff30_pct": km.get("diff30_pct", 0),
+            "diff10_pct": km.get("diff10_pct", 0),
+            "ma30_slope": km.get("ma30_slope", 0),
+            "ma30_r2": km.get("ma30_r2", 0),
+            "rsi": km.get("rsi", 50),
+            "ret_4w": km.get("ret_4w", 0),
+            "ret_8w": km.get("ret_8w", 0),
+            "ma_arrangement": km.get("ma_arrangement", 0),
+            "vol_ratio": km.get("vol_ratio", 1.0),
             **forward_ret
         })
 
@@ -922,21 +891,21 @@ def backtest_stock_strategy(stock_code: str, years: int = 3, min_history: int = 
 
     for fwd in ["4周", "8周", "12周"]:
         col = f"{fwd}收益%"
-        valid = buy_signals[buy_signals[f"{fwd}周"].notna()]
+        valid = buy_signals[buy_signals[fwd].notna()]
         if len(valid) == 0:
             stats_result[f"买入信号{fwd}胜率"] = np.nan
             stats_result[f"买入信号{fwd}平均收益%"] = np.nan
             continue
-        wins = (valid[f"{fwd}周"] > 0).sum()
+        wins = (valid[fwd] > 0).sum()
         stats_result[f"买入信号{fwd}胜率"] = round(wins / len(valid) * 100, 1)
-        stats_result[f"买入信号{fwd}平均收益%"] = round(valid[f"{fwd}周"].mean(), 2)
+        stats_result[f"买入信号{fwd}平均收益%"] = round(valid[fwd].mean(), 2)
 
     for fwd in ["4周", "8周", "12周"]:
         col = f"{fwd}收益%"
-        valid = sell_signals[sell_signals[f"{fwd}周"].notna()]
+        valid = sell_signals[sell_signals[fwd].notna()]
         if len(valid) == 0:
             continue
-        correct = (valid[f"{fwd}周"] < 0).sum()
+        correct = (valid[fwd] < 0).sum()
         stats_result[f"卖出信号{fwd}准确率"] = round(correct / len(valid) * 100, 1)
 
     score_bins = [0, 20, 40, 60, 80, 100]
@@ -952,6 +921,19 @@ def backtest_stock_strategy(stock_code: str, years: int = 3, min_history: int = 
                 stats_result[f"评分{label}8周平均收益%"] = round(valid_8w["8周"].mean(), 2)
 
     latest_stage = stage_info["stage"] if signals else "未知"
+
+    # ML 分类器训练（如果可用）
+    try:
+        classifier = get_ml_classifier()
+        if not classifier.available and len(df) >= classifier.min_samples:
+            train_result = classifier.train_from_backtest(df)
+            if train_result.get("status") == "trained":
+                print(f"  [ML] 股票{stock_code} 训练完成: "
+                      f"准确率={train_result.get('test_accuracy', 0):.1%}, "
+                      f"样本={train_result.get('samples', 0)}")
+    except Exception:
+        pass
+
     return {
         "回测概要": stats_result,
         "信号明细": df,

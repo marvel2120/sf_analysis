@@ -2,6 +2,7 @@
 共享工具模块 - 提取 advisor_fund.py 和 advisor_stock.py 中的通用函数
 并新增市场状态识别、ATR动态仓位等优化功能
 """
+import functools
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -81,25 +82,54 @@ def compute_macd(prices: pd.Series, fast: int = 12, slow: int = 26, signal: int 
 
 # ===================== 数据获取函数 =====================
 
-def fetch_index_weekly_close(index_symbol: str = "sh000300", years: int = 5) -> pd.DataFrame:
-    """获取基准指数周线数据"""
+@functools.lru_cache(maxsize=16)
+def _fetch_index_raw(index_symbol: str, years: int) -> tuple:
+    """缓存层：获取原始指数日线数据，返回可哈希的元组"""
     import akshare as ak
     end_date = datetime.now().strftime("%Y%m%d")
     start_date = (datetime.now() - timedelta(days=365 * years)).strftime("%Y%m%d")
 
     df = None
+    # method 1: stock_zh_index_daily (新版无 start_date/end_date 参数)
     try:
         df = ak.stock_zh_index_daily(symbol=index_symbol)
     except Exception:
-        try:
-            code = index_symbol.replace("sh", "").replace("sz", "")
-            df = ak.index_zh_a_hist(symbol=code, period="daily")
-        except Exception as e:
-            print(f"获取指数{index_symbol}数据失败: {str(e)}")
-            return pd.DataFrame()
+        pass
 
     if df is None or len(df) == 0:
+        # method 2: index_zh_a_hist 支持日期参数
+        try:
+            code = index_symbol.replace("sh", "").replace("sz", "")
+            df = ak.index_zh_a_hist(symbol=code, period="daily",
+                                     start_date=start_date, end_date=end_date)
+        except Exception:
+            return ()
+
+    if df is None or len(df) == 0:
+        return ()
+
+    # 按日期过滤（防止 method 1 返回过多数据）
+    date_col = "日期" if "日期" in df.columns else "date" if "date" in df.columns else None
+    if date_col and years > 0:
+        df[date_col] = pd.to_datetime(df[date_col])
+        cutoff = pd.Timestamp(end_date) - pd.DateOffset(years=years)
+        df = df[df[date_col] >= cutoff]
+
+    if len(df) == 0:
+        return ()
+
+    # 序列化 DataFrame 为元组以便缓存
+    return (df.to_dict("records"), list(df.columns))
+
+
+def fetch_index_weekly_close(index_symbol: str = "sh000300", years: int = 5) -> pd.DataFrame:
+    """获取基准指数周线数据（带缓存）"""
+    raw = _fetch_index_raw(index_symbol, years)
+    if not raw:
         return pd.DataFrame()
+
+    records, columns = raw
+    df = pd.DataFrame.from_records(records)[columns]
 
     date_col = "日期" if "日期" in df.columns else "date" if "date" in df.columns else None
     price_col = "收盘" if "收盘" in df.columns else "close" if "close" in df.columns else None
@@ -107,7 +137,6 @@ def fetch_index_weekly_close(index_symbol: str = "sh000300", years: int = 5) -> 
         return pd.DataFrame()
 
     df["date"] = pd.to_datetime(df[date_col])
-    df = df[(df["date"] >= pd.to_datetime(start_date)) & (df["date"] <= pd.to_datetime(end_date))]
     df[price_col] = pd.to_numeric(df[price_col], errors="coerce")
     df = df.sort_values("date").dropna(subset=[price_col, "date"]).set_index("date")
 

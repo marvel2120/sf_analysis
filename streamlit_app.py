@@ -2,6 +2,7 @@ import streamlit as st
 import sys
 import os
 import pandas as pd
+import concurrent.futures
 
 # 添加当前目录到路径，确保可以导入 advisor
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -83,20 +84,48 @@ with st.sidebar:
     
     # DeepSeek API Key 配置
     with st.expander("🤖 DeepSeek AI 配置（可选）"):
-        ds_key = st.text_input("DeepSeek API Key",
-                               value=st.session_state.get("deepseek_key", ""),
-                               type="password",
-                               placeholder="sk-xxx")
-        if ds_key:
+        import config as _cfg
+
+        # 是否启用 DeepSeek
+        enable_ds = st.checkbox(
+            "启用 DeepSeek AI 分析",
+            value=st.session_state.get("enable_deepseek", _cfg.DEEPSEEK_CONFIG.get('enabled', True)),
+            help="关闭后完全使用规则系统进行分析，不依赖 API Key"
+        )
+        st.session_state.enable_deepseek = enable_ds
+        _cfg.DEEPSEEK_CONFIG['enabled'] = enable_ds
+        _cfg.ANALYSIS_CONFIG['fund']['enable_deepseek'] = enable_ds
+
+        # API Key 输入：如果前端传了 key 就用前端的，否则用环境变量 DEEPSEEK_API_KEY
+        prev_key = st.session_state.get("deepseek_key", "")
+        ds_key = st.text_input(
+            "DeepSeek API Key（留空则使用环境变量 DEEPSEEK_API_KEY）",
+            value=prev_key,
+            type="password",
+            placeholder="sk-xxx，留空则使用环境变量"
+        )
+
+        if ds_key and ds_key != prev_key:
+            # 前端传入新 key → 使用前端 key
             st.session_state.deepseek_key = ds_key
-            # 同步到配置
-            import config
-            config.DEEPSEEK_CONFIG['api_key'] = ds_key
-            st.caption("✅ DeepSeek 已配置")
-        elif st.session_state.get("deepseek_key"):
-            st.caption("✅ DeepSeek 已配置")
+            _cfg.DEEPSEEK_CONFIG['api_key'] = ds_key
+            import advisor_fund
+            advisor_fund._deepseek_client = None  # 重置客户端缓存
+        elif not ds_key and prev_key:
+            # 用户清除了 key → 恢复为环境变量
+            del st.session_state.deepseek_key
+            _cfg.DEEPSEEK_CONFIG['api_key'] = os.environ.get("DEEPSEEK_API_KEY", "")
+            import advisor_fund
+            advisor_fund._deepseek_client = None  # 重置客户端缓存
+
+        if enable_ds:
+            if _cfg.DEEPSEEK_CONFIG.get('api_key'):
+                source = "（使用前端密钥）" if ds_key else "（使用环境变量）"
+                st.caption(f"✅ DeepSeek 已配置{source}")
+            else:
+                st.caption("⚠️ 未检测到 API Key，请输入或设置 DEEPSEEK_API_KEY 环境变量")
         else:
-            st.caption("💡 不配置则使用规则系统，不影响核心分析")
+            st.caption("💡 DeepSeek 已禁用，使用规则系统进行分析")
 
     # 分析按钮
     analyze_button = st.button("🔍 开始分析", type="primary", use_container_width=True)
@@ -292,6 +321,46 @@ def display_stock_analysis(result):
                 st.line_chart(chart_df)
             except Exception:
                 pass
+
+    # 市场状态（新增）
+    market_regime = result.get('市场状态分析', {})
+    if market_regime:
+        regime = market_regime.get('regime', 'unknown')
+        regime_icons = {
+            'strong_bull': '🚀', 'bull': '📈', 'sideways': '➡️',
+            'volatile_sideways': '🌊', 'volatile_bull': '⚡',
+            'bear': '📉', 'strong_bear': '🔻', 'unknown': '❓'
+        }
+        score = market_regime.get('score', 0)
+        desc = market_regime.get('description', '')
+        st.subheader("🌍 市场状态")
+        st.info(f"{regime_icons.get(regime, '❓')} **{regime}** (评分: {score}) — {desc}")
+
+    # DeepSeek AI 验证（新增）
+    ds_opinion = result.get('DeepSeek分析')
+    if ds_opinion:
+        with st.expander("🤖 DeepSeek AI 验证", expanded=False):
+            if isinstance(ds_opinion, dict):
+                agree = ds_opinion.get('agree')
+                if agree is not None:
+                    st.write(f"**是否同意系统判断:** {'✅ 同意' if agree else '⚠️ 不同意'}")
+                alt_stage = ds_opinion.get('alternative_stage')
+                alt_conf = ds_opinion.get('alternative_confidence')
+                if alt_stage:
+                    st.write(f"**替代判断:** {alt_stage} (置信度: {alt_conf}%)")
+                signals = ds_opinion.get('key_signals', [])
+                if signals:
+                    st.write("**看多信号:**")
+                    for s in signals:
+                        st.write(f"- {s}")
+                risks = ds_opinion.get('key_risks', [])
+                if risks:
+                    st.write("**看空信号:**")
+                    for r in risks:
+                        st.write(f"- {r}")
+                advice_text = ds_opinion.get('advice')
+                if advice_text:
+                    st.info(f"💡 {advice_text}")
 
     # 详细分析
     with st.expander("📈 技术分析详情"):
@@ -721,53 +790,62 @@ if analyze_button and code:
                     if batch_mode:
                         codes = [c.strip() for c in code.split(",") if c.strip()]
                         results = []
-                        progress_bar = st.progress(0)
                         status_text = st.empty()
-                        for idx, c in enumerate(codes):
-                            status_text.text(f"正在分析第 {idx+1}/{len(codes)} 只股票: {c}")
-                            r = analyze_stock(c)
-                            error_msg = r.get("错误信息", "")
-                            if error_msg == "历史数据不足":
-                                r["分析状态"] = "数据不足"
-                            elif error_msg:
-                                r["分析状态"] = "分析失败"
-                            else:
-                                r["分析状态"] = "成功"
-                            
-                            recent_5w = r.get("近五周均线差距", [])
-                            gap_trend = ""
-                            if len(recent_5w) >= 3:
-                                gaps = [w["gap_pct"] for w in recent_5w]
-                                if gaps[-1] > gaps[0]:
-                                    gap_trend = "逐步靠近 ↑" if gaps[-1] < 0 else "逐步远离 ↑"
-                                elif gaps[-1] < gaps[0]:
-                                    gap_trend = "逐步远离 ↓" if gaps[-1] < 0 else "逐步靠近 ↓"
+                        progress_bar = st.progress(0)
+                        status_text.text(f"正在并行分析 {len(codes)} 只股票...")
+
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(codes), 8)) as executor:
+                            future_map = {executor.submit(analyze_stock, c): c for c in codes}
+                            for idx, future in enumerate(concurrent.futures.as_completed(future_map)):
+                                c = future_map[future]
+                                status_text.text(f"处理中 ({idx+1}/{len(codes)}): {c}")
+                                try:
+                                    r = future.result()
+                                except Exception:
+                                    r = {"错误信息": f"分析异常", "股票代码": c, "股票名称": ""}
+
+                                error_msg = r.get("错误信息", "")
+                                if error_msg == "历史数据不足":
+                                    r["分析状态"] = "数据不足"
+                                elif error_msg:
+                                    r["分析状态"] = "分析失败"
                                 else:
-                                    gap_trend = "基本持平"
-                            
-                            strategy = r.get("交易策略", {})
-                            row = {
-                                "股票代码": c,
-                                "股票名称": r.get("股票名称", ""),
-                                "投资建议": r.get("投资建议", ""),
-                                "评分": r.get("投资评分", 0),
-                                "建议仓位(%)": r.get("建议仓位(%)", 0),
-                                "当前阶段": r.get("阶段", ""),
-                                "相对强度": r.get("相对强度", 0),
-                                "RSI": r.get("RSI", 50),
-                                "夏普比率": r.get("夏普比率", 0),
-                                "最大回撤(%)": r.get("最大回撤%", 0),
-                                "30周均值": r.get("30周均值", 0),
-                                "最新收盘": r.get("最新收盘", 0),
-                                "是否在30周线上": "是" if r.get("最新收盘", 0) > r.get("30周均值", 0) else "否",
-                                "近5周差距变化趋势": gap_trend,
-                                "止损位": r.get("止损建议", ""),
-                                "目标位": strategy.get("目标位", ""),
-                                "分析状态": r.get("分析状态", "成功"),
-                            }
-                            results.append(row)
-                            progress_bar.progress((idx + 1) / len(codes))
-                        
+                                    r["分析状态"] = "成功"
+
+                                recent_5w = r.get("近五周均线差距", [])
+                                gap_trend = ""
+                                if len(recent_5w) >= 3:
+                                    gaps = [w["gap_pct"] for w in recent_5w]
+                                    if gaps[-1] > gaps[0]:
+                                        gap_trend = "逐步靠近 ↑" if gaps[-1] < 0 else "逐步远离 ↑"
+                                    elif gaps[-1] < gaps[0]:
+                                        gap_trend = "逐步远离 ↓" if gaps[-1] < 0 else "逐步靠近 ↓"
+                                    else:
+                                        gap_trend = "基本持平"
+
+                                strategy = r.get("交易策略", {})
+                                row = {
+                                    "股票代码": c,
+                                    "股票名称": r.get("股票名称", ""),
+                                    "投资建议": r.get("投资建议", ""),
+                                    "评分": r.get("投资评分", 0),
+                                    "建议仓位(%)": r.get("建议仓位(%)", 0),
+                                    "当前阶段": r.get("阶段", ""),
+                                    "相对强度": r.get("相对强度", 0),
+                                    "RSI": r.get("RSI", 50),
+                                    "夏普比率": r.get("夏普比率", 0),
+                                    "最大回撤(%)": r.get("最大回撤%", 0),
+                                    "30周均值": r.get("30周均值", 0),
+                                    "最新收盘": r.get("最新收盘", 0),
+                                    "是否在30周线上": "是" if r.get("最新收盘", 0) > r.get("30周均值", 0) else "否",
+                                    "近5周差距变化趋势": gap_trend,
+                                    "止损位": r.get("止损建议", ""),
+                                    "目标位": strategy.get("目标位", ""),
+                                    "分析状态": r.get("分析状态", "成功"),
+                                }
+                                results.append(row)
+                                progress_bar.progress((idx + 1) / len(codes))
+
                         status_text.empty()
                         progress_bar.empty()
                         
@@ -836,11 +914,24 @@ if analyze_button and code:
                     if batch_mode:
                         codes = [c.strip() for c in code.split(",") if c.strip()]
                         results = []
-                        for c in codes:
-                            r = analyze_fund_enhanced(c)
+                        status_text = st.empty()
+                        progress_bar = st.progress(0)
+                        status_text.text(f"正在分析 {len(codes)} 只基金...")
+
+                        for idx, c in enumerate(codes):
+                            status_text.text(f"处理中 ({idx+1}/{len(codes)}): {c}")
+                            try:
+                                r = analyze_fund_enhanced(c)
+                            except Exception:
+                                results.append({"基金代码": c, "错误": f"分析异常"})
+                                progress_bar.progress((idx + 1) / len(codes))
+                                continue
+
                             if "错误" in r:
                                 results.append({"基金代码": c, "错误": r.get("错误", "")})
+                                progress_bar.progress((idx + 1) / len(codes))
                                 continue
+
                             fund_info = r.get("基金基本信息", {})
                             trend = r.get("趋势分析", {})
                             rs_analysis = r.get("相对强度分析", {})
@@ -852,16 +943,13 @@ if analyze_button and code:
                             latest_nav = latest.get("单位净值", 0)
                             latest_ma30 = latest.get("30周均线", 0)
                             above_ma30 = latest_ma30 > 0 and latest_nav > latest_ma30
-                            # 计算与30周均线的差距百分比
                             nav_vs_ma30 = ((latest_nav - latest_ma30) / latest_ma30 * 100) if latest_ma30 > 0 else 0
-                            
-                            # 获取最近5周数据
+
                             recent_5w_data = latest.get("最近5周数据", [])
-                            # 提取最近5周的距离数据，用于快速查看
                             recent_5w_distances = []
                             for week in recent_5w_data:
                                 recent_5w_distances.append(f"{week['日期']}: {week['距离(%)']}%")
-                            
+
                             row = {
                                 "基金代码": fund_info.get("基金代码", c),
                                 "基金名称": fund_info.get("基金名称", ""),
@@ -882,6 +970,10 @@ if analyze_button and code:
                                 "评分": advice.get("评分", 0),
                             }
                             results.append(row)
+                            progress_bar.progress((idx + 1) / len(codes))
+
+                        status_text.empty()
+                        progress_bar.empty()
                         if results:
                             st.success("批量分析完成")
                             df = pd.DataFrame(results)

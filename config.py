@@ -38,6 +38,7 @@ ML_CONFIG = {
     'enabled': True,
     'min_samples': 80,
     'ml_weight': 0.3,        # ML在融合中的权重
+    'model_type': 'xgb',     # 模型类型: 'xgb' (XGBoost) 或 'rf' (RandomForest)
     'retrain_interval_days': 7  # 自动重训练间隔
 }
 
