@@ -4,6 +4,15 @@ import numpy as np
 import akshare as ak
 from scipy import stats
 import warnings
+
+# 从共享模块导入通用工具函数（消除重复代码）
+from market_utils import (
+    compute_ma_slope, compute_rsi_series, calculate_rsi,
+    compute_atr, compute_bollinger_bands, compute_macd,
+    fetch_index_weekly_close, relative_strength_enhanced,
+    risk_assessment as risk_assessment_market,  # 保留原名用于兼容
+    detect_market_regime
+)
 warnings.filterwarnings('ignore')
 
 # ===================== 基础数据获取 =====================

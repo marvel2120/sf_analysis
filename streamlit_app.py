@@ -81,6 +81,23 @@ with st.sidebar:
         batch_mode = st.checkbox("批量分析（逗号分隔多个基金代码）")
         invest_amount = st.number_input("总投资金额(元)", min_value=0.0, value=0.0, step=1000.0)
     
+    # DeepSeek API Key 配置
+    with st.expander("🤖 DeepSeek AI 配置（可选）"):
+        ds_key = st.text_input("DeepSeek API Key",
+                               value=st.session_state.get("deepseek_key", ""),
+                               type="password",
+                               placeholder="sk-xxx")
+        if ds_key:
+            st.session_state.deepseek_key = ds_key
+            # 同步到配置
+            import config
+            config.DEEPSEEK_CONFIG['api_key'] = ds_key
+            st.caption("✅ DeepSeek 已配置")
+        elif st.session_state.get("deepseek_key"):
+            st.caption("✅ DeepSeek 已配置")
+        else:
+            st.caption("💡 不配置则使用规则系统，不影响核心分析")
+
     # 分析按钮
     analyze_button = st.button("🔍 开始分析", type="primary", use_container_width=True)
     
@@ -355,29 +372,43 @@ def display_fund_analysis(result):
     risk_analysis = result.get('风险评估', {})
     advice_result = result.get('投资建议', {})
     
-    # 核心指标卡片 - 顶部展示
-    col1, col2, col3, col4 = st.columns(4)
-    
+    # 市场状态显示（新增）
+    market_regime = result.get('市场状态分析', {})
+    regime = market_regime.get('regime', 'unknown')
+    regime_icons = {
+        'strong_bull': '🚀', 'bull': '📈', 'sideways': '➡️',
+        'volatile_sideways': '🌊', 'volatile_bull': '⚡',
+        'bear': '📉', 'strong_bear': '🔻', 'unknown': '❓'
+    }
+    regime_desc = market_regime.get('description', '')
+
+    # 核心指标卡片 - 顶部展示（新增市场状态）
+    col1, col2, col3, col4, col5 = st.columns(5)
+
     with col1:
+        st.metric("市场状态", f"{regime_icons.get(regime, '❓')} {regime}",
+                 help=regime_desc)
+
+    with col2:
         stage = trend_analysis.get('stage', '未知')
         stage_confidence = trend_analysis.get('confidence', 0) * 100
         stage_reason = trend_analysis.get('reason', '')
-        st.metric("当前趋势", stage, help=stage_reason)
-    
-    with col2:
-        latest_nav = latest_data.get('单位净值', 0)
-        ma30 = latest_data.get('30周均线', 0)
-        nav_vs_ma30 = ((latest_nav - ma30) / ma30 * 100) if ma30 > 0 else 0
-        st.metric("最新净值", f"{latest_nav:.4f}", 
-                 delta=f"{nav_vs_ma30:+.1f}% vs 30周均线" if nav_vs_ma30 != 0 else None)
-    
+        st.metric("当前趋势", f"阶段{stage}", help=stage_reason)
+
     with col3:
+        latest_nav = latest_data.get('单位净值', 0)
+        ma20 = latest_data.get('20周均线', 0)
+        nav_vs_ma20 = ((latest_nav - ma20) / ma20 * 100) if ma20 > 0 else 0
+        st.metric("最新净值", f"{latest_nav:.4f}",
+                 delta=f"{nav_vs_ma20:+.1f}% vs 20周均线" if nav_vs_ma20 != 0 else None)
+
+    with col4:
         max_drawdown = latest_data.get('最大回撤(%)', risk_analysis.get('max_drawdown', 0))
-        st.metric("最大回撤", f"{max_drawdown:.1f}%", 
+        st.metric("最大回撤", f"{max_drawdown:.1f}%",
                  delta="风险较高" if max_drawdown < -20 else "风险适中" if max_drawdown < -10 else "风险较低",
                  delta_color="inverse")
-    
-    with col4:
+
+    with col5:
         sharpe_ratio = latest_data.get('夏普比率', risk_analysis.get('sharpe_ratio', 0))
         st.metric("夏普比率", f"{sharpe_ratio:.2f}",
                  delta="优秀" if sharpe_ratio > 1.0 else "良好" if sharpe_ratio > 0.5 else "一般",
@@ -395,10 +426,42 @@ def display_fund_analysis(result):
     <div class="advice-box {advice_class}">
         <h3>{advice} (评分: {advice_score:.0f}/100, 置信度: {advice_confidence:.0f}%)</h3>
         <p><strong>建议说明:</strong> {advice_desc}</p>
-        <p><strong>建议仓位:</strong> {advice_result.get('建议仓位(%)', 0):.0f}%</p>
+        <p><strong>建议仓位:</strong> {advice_result.get('建议仓位(%)', 0):.0f}% /
+           <strong>止损:</strong> {advice_result.get('止损建议(%)', 5):.1f}% /
+           <strong>目标:</strong> {advice_result.get('目标收益(%)', 10):.1f}%</p>
     </div>
     """
     st.markdown(advice_html, unsafe_allow_html=True)
+
+    # 模糊阶段概率展示（新增）
+    stage_probs = trend_analysis.get('stage_probs', {})
+    if stage_probs and any(v > 0 for v in stage_probs.values()):
+        st.subheader("📊 阶段概率分布")
+        prob_cols = st.columns(4)
+        prob_stages = [
+            ("筑底期", "accumulation", "#6c757d"),
+            ("上升期", "rising", "#28a745"),
+            ("顶部期", "top", "#ffc107"),
+            ("下跌期", "falling", "#dc3545")
+        ]
+        for col, (label, key, color) in zip(prob_cols, prob_stages):
+            prob = stage_probs.get(key, 0) * 100
+            col.metric(label, f"{prob:.0f}%")
+            col.markdown(f'<div style="background:{color};height:5px;border-radius:3px;width:{min(prob,100)}%"></div>',
+                        unsafe_allow_html=True)
+
+    # ATR仓位分析（新增）
+    position_info = result.get('仓位分析', {})
+    if position_info:
+        with st.expander("📐 动态仓位分析（ATR）", expanded=False):
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("建议仓位", f"{position_info.get('position_pct', 0):.1f}%")
+            col2.metric("ATR波动率", f"{position_info.get('atr_pct', 0):.2f}%")
+            col3.metric("止损距离", f"{position_info.get('stop_loss_pct', 0):.1f}%")
+            col4.metric("目标收益", f"{position_info.get('target_pct', 0):.1f}%")
+            st.caption(f"市场乘数: {position_info.get('regime_multiplier', 0):.1f}x | "
+                      f"波动调整: {position_info.get('vol_adjustment', 0):.1f}x | "
+                      f"基于ATR的动态仓位在高波动时自动降低")
     
     # 评分计算详情
     score_details = advice_result.get('评分详情', {})
@@ -456,21 +519,24 @@ def display_fund_analysis(result):
             with col1:
                 st.write("**关键指标:**")
                 key_metrics = trend_analysis.get('key_metrics', {})
-                st.write(f"- 均线偏离度: {key_metrics.get('ma30_diff_pct', 0):+.1f}%")
+                st.write(f"- 10周均线偏离: {key_metrics.get('diff10_pct', 0):+.1f}%")
+                st.write(f"- 30周均线偏离: {key_metrics.get('diff30_pct', 0):+.1f}%")
                 st.write(f"- 30周均线斜率: {key_metrics.get('ma30_slope', 0):+.3f}")
-                st.write(f"- 均线拟合度: {key_metrics.get('ma30_r2', 0):.3f}")
-                st.write(f"- 成交量比率: {key_metrics.get('vol_ratio', 0):.2f}")
-            
+                st.write(f"- 均线拟合度R²: {key_metrics.get('ma30_r2', 0):.3f}")
+                st.write(f"- RSI(14): {key_metrics.get('rsi', 50):.1f}")
+
             with col2:
                 st.write("**趋势判断:**")
                 st.write(f"- 当前阶段: 第{trend_analysis.get('stage', 1)}阶段")
                 st.write(f"- 置信度: {trend_analysis.get('confidence', 0)*100:.0f}%")
                 st.write(f"- 判断理由: {trend_analysis.get('reason', '暂无')}")
-                
+
                 # 均线排列状态
                 ma_arrangement = key_metrics.get('ma_arrangement', 0)
                 arrangement_text = {1: "多头排列", 0: "缠绕整理", -1: "空头排列"}.get(ma_arrangement, "未知")
                 st.write(f"- 均线排列: {arrangement_text}")
+                st.write(f"- 4周涨幅: {key_metrics.get('ret_4w', 0):+.2f}%")
+                st.write(f"- 8周涨幅: {key_metrics.get('ret_8w', 0):+.2f}%")
         else:
             st.write("暂无趋势分析数据")
     
@@ -531,7 +597,46 @@ def display_fund_analysis(result):
         else:
             st.write("暂无风险评估数据")
     
-    # 交易策略（新增）
+    # ML分析展示（新增）
+    ml_info = result.get('ML分析')
+    if ml_info and ml_info.get("ml_info"):
+        with st.expander("🧠 机器学习分析"):
+            st.write(f"**ML预测阶段:** 第{ml_info.get('stage', '?')}阶段 "
+                    f"(置信度: {ml_info.get('confidence', 0)*100:.0f}%)")
+            st.write(f"**阶段概率:** {ml_info.get('stage_probs', {})}")
+            feat_imp = ml_info.get('ml_info', {}).get('feature_importance', {})
+            if feat_imp:
+                st.write("**特征重要性:**")
+                for feat, imp in sorted(feat_imp.items(), key=lambda x: -x[1]):
+                    st.write(f"- {feat}: {imp:.1%}")
+
+    # DeepSeek分析展示（新增）
+    ds_opinion = result.get('DeepSeek分析')
+    if ds_opinion:
+        with st.expander("🤖 DeepSeek AI 验证"):
+            if isinstance(ds_opinion, dict):
+                agree = ds_opinion.get('agree')
+                if agree is not None:
+                    st.write(f"**是否同意系统判断:** {'✅ 同意' if agree else '⚠️ 不同意'}")
+                alt_stage = ds_opinion.get('alternative_stage')
+                alt_conf = ds_opinion.get('alternative_confidence')
+                if alt_stage:
+                    st.write(f"**替代判断:** {alt_stage} (置信度: {alt_conf}%)")
+                signals = ds_opinion.get('key_signals', [])
+                if signals:
+                    st.write("**看多信号:**")
+                    for s in signals:
+                        st.write(f"- {s}")
+                risks = ds_opinion.get('key_risks', [])
+                if risks:
+                    st.write("**看空信号:**")
+                    for r in risks:
+                        st.write(f"- {r}")
+                advice_text = ds_opinion.get('advice')
+                if advice_text:
+                    st.info(f"💡 {advice_text}")
+
+    # 交易策略
     trading_strategy = result.get('交易策略', {})
     if trading_strategy:
         with st.expander("🎯 具体交易策略"):

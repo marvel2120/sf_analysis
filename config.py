@@ -7,8 +7,8 @@ import os
 
 # 应用配置
 APP_NAME = "智能投资分析系统"
-APP_VERSION = "1.0.0"
-APP_DESCRIPTION = "基于Streamlit的股票基金分析Web应用"
+APP_VERSION = "2.0.0"
+APP_DESCRIPTION = "基于Streamlit的基金股票分析Web应用（中短线优化版）"
 
 # Streamlit配置
 STREAMLIT_CONFIG = {
@@ -25,33 +25,64 @@ SERVER_CONFIG = {
     'headless': True
 }
 
+# DeepSeek 配置（用户可在界面或环境变量中设置）
+DEEPSEEK_CONFIG = {
+    'api_key': os.environ.get("DEEPSEEK_API_KEY", ""),
+    'model': 'deepseek-chat',
+    'timeout': 15,
+    'enabled': True  # 设为False可完全禁用
+}
+
+# ML 模型配置
+ML_CONFIG = {
+    'enabled': True,
+    'min_samples': 80,
+    'ml_weight': 0.3,        # ML在融合中的权重
+    'retrain_interval_days': 7  # 自动重训练间隔
+}
+
 # 分析参数配置
 ANALYSIS_CONFIG = {
+    # 基金分析参数（中短线优化）
+    'fund': {
+        'benchmark_index': 'sh000300',
+        'analysis_years': 3,
+        'primary_ma': 20,           # 主均线周期（中短线从30改为20周）
+        'secondary_ma': 10,         # 辅均线周期
+        'tertiary_ma': 30,          # 长期均线参考
+        'rsi_period': 14,
+        'risk_free_rate': 0.02,
+        'max_position_pct': 70,     # 最大仓位
+        'enable_deepseek': True,
+        'enable_ml': True,
+    },
+
     # 股票分析参数
     'stock': {
-        'relative_strength_period': 12,  # 相对强弱计算周期（周）
-        'breakout_period': 12,          # 突破检测周期（周）
-        'volume_threshold': 1.5,          # 量能阈值倍数
-        'min_data_points': 50,           # 最小数据点要求
+        'relative_strength_period': 12,
+        'breakout_period': 12,
+        'volume_threshold': 1.5,
+        'min_data_points': 50,
     },
-    
-    # 基金分析参数
-    'fund': {
-        'benchmark_index': 'sh000300',   # 基准指数
-        'analysis_years': 3,             # 分析年限
-        'min_weeks_for_stage': 8,        # 趋势判断最小周数
-        'rs_lookback_weeks': 26,         # 相对强弱回看周数
-        'risk_free_rate': 0.03,          # 无风险利率（年化）
+
+    # 回测参数
+    'backtest': {
+        'min_history_weeks': 60,
+        'forward_weeks': [4, 8, 12],  # 评估未来N周表现
+        'position_threshold': 0.05,    # 调仓敏感度
     }
 }
 
-# 投资建议映射
-ADVICE_MAPPING = {
-    '强烈买入': {'class': 'buy-advice', 'color': '#28a745', 'icon': '🚀'},
-    '买入': {'class': 'buy-advice', 'color': '#28a745', 'icon': '👍'},
-    '观望': {'class': 'hold-advice', 'color': '#ffc107', 'icon': '⏸️'},
-    '卖出': {'class': 'sell-advice', 'color': '#dc3545', 'icon': '👎'},
-    '强烈卖出': {'class': 'sell-advice', 'color': '#dc3545', 'icon': '⚠️'},
+# 市场状态对应仓位限制（中短线优化）
+MARKET_REGIME_CONFIG = {
+    'strong_bull': {'max_position': 80, 'description': '强势牛市，积极配置'},
+    'bull': {'max_position': 70, 'description': '温和牛市，正常配置'},
+    'sideways': {'max_position': 50, 'description': '震荡市场，波段操作'},
+    'volatile_sideways': {'max_position': 35, 'description': '高波动震荡，谨慎波段'},
+    'volatile_bull': {'max_position': 45, 'description': '高波动牛市，控制仓位'},
+    'bear': {'max_position': 25, 'description': '熊市，防守为主'},
+    'strong_bear': {'max_position': 10, 'description': '深度熊市，空仓观望'},
+    'unknown': {'max_position': 30, 'description': '信号不明确，轻仓试探'},
 }
 
 # 趋势阶段定义
@@ -63,9 +94,9 @@ STAGE_DEFINITIONS = {
 
 # 数据获取配置
 DATA_CONFIG = {
-    'retry_times': 3,                    # 重试次数
-    'timeout': 30,                       # 超时时间（秒）
-    'cache_hours': 6,                    # 缓存时间（小时）
+    'retry_times': 3,
+    'timeout': 30,
+    'cache_hours': 6,
 }
 
 # 日志配置
@@ -73,15 +104,6 @@ LOGGING_CONFIG = {
     'level': 'INFO',
     'format': '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     'file': 'investment_analysis.log'
-}
-
-# 错误消息
-ERROR_MESSAGES = {
-    'network_error': '网络连接失败，请检查网络后重试',
-    'data_not_found': '未找到相关数据，请检查代码是否正确',
-    'analysis_failed': '分析失败，请稍后重试',
-    'invalid_code': '代码格式不正确，请输入有效的股票或基金代码',
-    'insufficient_data': '数据量不足，无法完成分析',
 }
 
 # 路径配置
